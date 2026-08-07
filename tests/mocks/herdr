@@ -15,7 +15,8 @@
 # individual list commands above -- both paths stay covered.
 #
 # Mutating commands (the whole point of the test) are appended verbatim to
-# $HERDR_MOCK_LOG so the test can assert exactly which renames the engine issued.
+# $HERDR_MOCK_LOG so the test can assert exactly which renames and metadata
+# reports the engine issued.
 # A missing query fixture yields a valid-but-empty result so the engine degrades
 # the same way it would against a real herdr that returned nothing.
 
@@ -58,6 +59,10 @@ case "$group" in
         p=""
         while [ $# -gt 0 ]; do case "$1" in --pane) p="$2"; shift 2 ;; *) shift ;; esac; done
         serve "procinfo_$p.json" '{}' ;;
+      report-metadata)
+        printf 'pane report-metadata' >>"$log"
+        for arg in "$@"; do printf ' %s' "$arg" >>"$log"; done
+        printf '\n' >>"$log" ;;
     esac ;;
   agent)
     case "$action" in

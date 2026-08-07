@@ -105,6 +105,17 @@ word never was. When sampling fails the engine renames nothing rather than guess
 ## Numbering caveats
 
 - **Tabs** are numbered by array order, not the non-contiguous `.number` field.
+  On herdr 0.8.0 or newer, that same 1-9 position is also published to every
+  pane in the tab as the plain custom token `tab_number`. This gives pane-backed
+  agent rows a stable number without changing agent names or coupling the row to
+  the tab's responsive display label. `ar_sync_tab_number_token` reads both pane
+  identity and `.tokens.tab_number` from the cached snapshot or `pane list`,
+  skips an already-correct value, and clears a stale token for positions 10+.
+  Turning `AUTO_INDEX` off or running `clear` removes only this token. The
+  `herdr-automatic-rename` source id owns each report; an unreadable or pre-0.8
+  Herdr version disables the path rather than issuing an unsupported command.
+  Shell-hook fast paths never report it because a program or cwd change cannot
+  alter tab position; structural event reconciles own the metadata lifecycle.
 - **Workspaces** are numbered by herdr's visible sidebar order, not the raw
   `workspace list` order. `alt+N` resolves through herdr's own
   `workspace_at_visible_position`, so a row the sidebar does not render is a row no

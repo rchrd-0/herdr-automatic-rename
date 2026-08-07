@@ -12,7 +12,9 @@
 #                 rejects a bracketed agent name outright, see ar_agent_prefix_ok)
 #                 and only when the panel is grouped-sorted ("priority" sort
 #                 reorders the panel behind an API we can't read, see
-#                 ar_agent_sort). Agent prefixes are stripped in both cases.
+#                 ar_agent_sort). Agent prefixes are stripped in both cases. On
+#                 herdr >= 0.8.0 it also reports each pane's plain 1-9 tab
+#                 position as the custom sidebar token `tab_number`.
 #
 # Both default on and are configured in config.sh ($HERDR_AUTOMATIC_RENAME_CONFIG). A
 # single unified reconcile drives both: one pass computes a tab's base name and
@@ -50,6 +52,8 @@ STATE_FILE="$STATE_DIR/state.json"
 LOCK_DIR="$STATE_DIR/lock"
 RERUN_FLAG="$STATE_DIR/rerun"
 CONFIG_FILE="${HERDR_AUTOMATIC_RENAME_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/herdr-automatic-rename/config.sh}"
+AR_METADATA_SOURCE="herdr-automatic-rename"
+AR_TAB_NUMBER_TOKEN="tab_number"
 
 # The prerequisite checks, config + naming load, toggle defaults, mode parse, and
 # dispatch all live in ar_main (bottom of file) so that sourcing this file for
@@ -451,6 +455,54 @@ ar_renumber_workspaces() {
   done <<< "$rows"
 }
 
+# ar_clear_tab_number_tokens [tab_id]
+# Remove this plugin's tab-number token from panes that currently carry it.
+# With a tab id, limit the clear to panes in that tab; without one, clear every
+# cached pane. Other custom metadata sources and tokens are left untouched.
+ar_clear_tab_number_tokens() {
+  local tid="${1:-}" rows pid
+  rows=$(printf '%s' "$AR_PANES_JSON" | jq -r \
+    --arg t "$tid" --arg token "$AR_TAB_NUMBER_TOKEN" '
+      (.result.panes // .panes // [])[]
+      | select($t == "" or .tab_id == $t)
+      | select((.tokens // {}) | has($token))
+      | .pane_id // empty
+    ' 2>/dev/null)
+  [ -n "$rows" ] || return 0
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    "$HERDR" pane report-metadata "$pid" \
+      --source "$AR_METADATA_SOURCE" \
+      --clear-token "$AR_TAB_NUMBER_TOKEN" >/dev/null 2>&1 || true
+  done <<< "$rows"
+}
+
+# ar_sync_tab_number_token <tab_id> <position>
+# Publish a plain 1-9 tab position to every pane in the tab, skipping panes whose
+# cached token is already correct. Positions past 9 have no jump key, so clear a
+# stale value instead of reporting an unreachable number.
+ar_sync_tab_number_token() {
+  local tid=$1 pos=$2 rows pid
+  if [ "$pos" -lt 1 ] || [ "$pos" -gt 9 ]; then
+    ar_clear_tab_number_tokens "$tid"
+    return 0
+  fi
+  rows=$(printf '%s' "$AR_PANES_JSON" | jq -r \
+    --arg t "$tid" --arg token "$AR_TAB_NUMBER_TOKEN" --arg want "$pos" '
+      (.result.panes // .panes // [])[]
+      | select(.tab_id == $t)
+      | select((((.tokens // {})[$token]) // "") != $want)
+      | .pane_id // empty
+    ' 2>/dev/null)
+  [ -n "$rows" ] || return 0
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    "$HERDR" pane report-metadata "$pid" \
+      --source "$AR_METADATA_SOURCE" \
+      --token "$AR_TAB_NUMBER_TOKEN=$pos" >/dev/null 2>&1 || true
+  done <<< "$rows"
+}
+
 # Tabs: cmd+N indexes the focused workspace's tabs by ARRAY ORDER (NOT the
 # non-contiguous .number field), so renumber each workspace's tabs 1..N
 # independently by array position. This is also where auto-naming happens (tabs
@@ -479,6 +531,10 @@ ar_reconcile_tabs() {
     while IFS=$'\t' read -r tid label pcount foc; do
       [ -n "$tid" ] || continue
       i=$(( i + 1 ))
+      if [ "${AR_TAB_METADATA_OK:-0}" = "1" ] && [ "$CLEAR" != "1" ] \
+         && [ "$AUTO_INDEX" = "1" ]; then
+        ar_sync_tab_number_token "$tid" "$i"
+      fi
       AR_SEEN_TABS="$AR_SEEN_TABS $tid"
       base0=$(ar_strip_prefix "$label")
       base=$base0
@@ -617,6 +673,15 @@ ar_agent_prefix_ok() {
   ar_version_lt "$v" "0.7.5"
 }
 
+# ar_tab_metadata_ok -> 0 when pane custom metadata and row tokens are available.
+# `pane report-metadata` arrived in herdr 0.8.0. An unreadable version disables
+# reporting so older installations keep working without rejected CLI calls.
+ar_tab_metadata_ok() {
+  local v
+  v=$(ar_herdr_version) || return 1
+  ! ar_version_lt "$v" "0.8.0"
+}
+
 # ar_agent_sort -> "priority" or "spaces" (grouped). herdr renders the agent panel
 # in its agent_panel_sort order: "spaces"/"workspaces" (grouped by space) or
 # "priority" (attention queue). cmd+alt+N follows that VISIBLE order, but the CLI
@@ -746,7 +811,7 @@ ar_wait_tab_gone() {
 # Full reconcile of every list, gated by the toggles. --clear ignores the toggles
 # and strips everything (the uninstall path).
 ar_reconcile() {
-  local wsjson snap
+  local wsjson snap need_panes=0
   # A reset deletes the target tab's state once (under the lock) so it re-adopts.
   if [ -n "${AR_FORCE_TAB:-}" ] && [ -z "${AR_FORCE_DONE:-}" ]; then
     ar_state_del "$AR_FORCE_TAB"
@@ -768,6 +833,13 @@ ar_reconcile() {
   AR_HAVE_SNAPSHOT=0
   AR_SNAP_TABS_JSON=""
   AR_SNAP_AGENTS_JSON=""
+  AR_PANES_JSON='{"result":{"panes":[]}}'
+  AR_TAB_METADATA_OK=0
+  ar_tab_metadata_ok && AR_TAB_METADATA_OK=1
+  if { [ "$CLEAR" != "1" ] && [ "$NAME_TABS" = "1" ]; } \
+     || [ "$AR_TAB_METADATA_OK" = "1" ]; then
+    need_panes=1
+  fi
   snap=$("$HERDR" api snapshot 2>/dev/null) || snap=""
   if [ -n "$snap" ] && printf '%s' "$snap" \
        | jq -e '(.result.snapshot // .snapshot).workspaces' >/dev/null 2>&1; then
@@ -778,16 +850,21 @@ ar_reconcile() {
       '{result:{tabs:((.result.snapshot // .snapshot).tabs // [])}}' 2>/dev/null)
     AR_SNAP_AGENTS_JSON=$(printf '%s' "$snap" | jq -c \
       '{result:{agents:((.result.snapshot // .snapshot).agents // [])}}' 2>/dev/null)
-    if [ "$CLEAR" != "1" ] && [ "$NAME_TABS" = "1" ]; then
+    if [ "$need_panes" = "1" ]; then
       AR_PANES_JSON=$(printf '%s' "$snap" | jq -c \
         '{result:{panes:((.result.snapshot // .snapshot).panes // [])}}' 2>/dev/null)
       [ -n "$AR_PANES_JSON" ] || AR_PANES_JSON='{"result":{"panes":[]}}'
     fi
   else
     wsjson=$("$HERDR" workspace list 2>/dev/null) || wsjson=""
-    if [ "$CLEAR" != "1" ] && [ "$NAME_TABS" = "1" ]; then
+    if [ "$need_panes" = "1" ]; then
       AR_PANES_JSON=$("$HERDR" pane list 2>/dev/null) || AR_PANES_JSON='{"result":{"panes":[]}}'
+      [ -n "$AR_PANES_JSON" ] || AR_PANES_JSON='{"result":{"panes":[]}}'
     fi
+  fi
+  if [ "$AR_TAB_METADATA_OK" = "1" ] \
+     && { [ "$CLEAR" = "1" ] || [ "$AUTO_INDEX" != "1" ]; }; then
+    ar_clear_tab_number_tokens
   fi
   if [ "$CLEAR" = "1" ] || [ "$AUTO_INDEX" = "1" ]; then
     ar_renumber_workspaces "$wsjson"

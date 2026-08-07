@@ -91,6 +91,7 @@ check_contains "tab2 named+numbered"   "$out" "tab rename w1:t2 [2] nvim"
 check_absent   "placeholder deferred"  "$out" "tab rename w2:t1"
 check_contains "agent numbered by pane id" "$out" "agent rename w1:pA [1] claude"
 check_absent   "agent never targeted by terminal id" "$out" "agent rename term_a"
+check_absent   "old herdr skips pane metadata" "$out" "pane report-metadata"
 teardown
 
 # ======================================================================
@@ -134,7 +135,9 @@ fixture tabs_w1.json <<'JSON'
 {"result":{"tabs":[{"tab_id":"w1:t1","label":"[1] zsh","pane_count":1,"focused":true}]}}
 JSON
 fixture panes.json <<'JSON'
-{"result":{"panes":[{"pane_id":"p1","tab_id":"w1:t1","focused":true}]}}
+{"result":{"panes":[
+  {"pane_id":"p1","tab_id":"w1:t1","focused":true,"tokens":{"tab_number":"1","other":"keep"}}
+]}}
 JSON
 fixture agents.json <<'JSON'
 {"result":{"agents":[{"terminal_id":"term_a","pane_id":"w1:pA","name":"[1] claude","agent_session":{"agent":"claude"}}]}}
@@ -144,6 +147,8 @@ out=$(log)
 check_contains "ws prefix stripped"    "$out" "workspace rename w1 api"
 check_contains "tab prefix stripped"   "$out" "tab rename w1:t1 zsh"
 check_contains "agent reverted"        "$out" "agent rename w1:pA --clear"
+check_contains "clear removes tab token" "$out" \
+  "pane report-metadata p1 --source herdr-automatic-rename --clear-token tab_number"
 teardown
 
 # ======================================================================
@@ -581,6 +586,75 @@ JSON
 run_event tab.focused
 check_contains "SHOW_CWD disabled: existing reconcile output" "$(log)" "tab rename w1:t1 nvim"
 check_absent "SHOW_CWD disabled: no cwd suffix" "$(log)" "project"
+teardown
+
+# ======================================================================
+# Scenario 17: herdr >= 0.8 pane metadata exposes the tab's 1-9 jump number
+#   independently from its responsive display label. Every pane in a numbered
+#   tab receives the same plain numeric token, an already-correct token is not
+#   rewritten, and a pane beyond the ninth tab has a stale token cleared.
+# ======================================================================
+setup
+export NAME_TABS=0 AUTO_INDEX=1
+export HERDR_MOCK_VERSION=0.8.0
+fixture snapshot.json <<'JSON'
+{"result":{"snapshot":{
+  "workspaces":[{"workspace_id":"w1","label":"api"}],
+  "tabs":[
+    {"tab_id":"w1:t1","label":"one","pane_count":2,"workspace_id":"w1"},
+    {"tab_id":"w1:t2","label":"two","pane_count":1,"workspace_id":"w1"},
+    {"tab_id":"w1:t3","label":"three","pane_count":0,"workspace_id":"w1"},
+    {"tab_id":"w1:t4","label":"four","pane_count":0,"workspace_id":"w1"},
+    {"tab_id":"w1:t5","label":"five","pane_count":0,"workspace_id":"w1"},
+    {"tab_id":"w1:t6","label":"six","pane_count":0,"workspace_id":"w1"},
+    {"tab_id":"w1:t7","label":"seven","pane_count":0,"workspace_id":"w1"},
+    {"tab_id":"w1:t8","label":"eight","pane_count":0,"workspace_id":"w1"},
+    {"tab_id":"w1:t9","label":"nine","pane_count":0,"workspace_id":"w1"},
+    {"tab_id":"w1:t10","label":"ten","pane_count":1,"workspace_id":"w1"}
+  ],
+  "panes":[
+    {"pane_id":"p1","tab_id":"w1:t1","tokens":{}},
+    {"pane_id":"p2","tab_id":"w1:t1","tokens":{}},
+    {"pane_id":"p3","tab_id":"w1:t2","tokens":{"tab_number":"2"}},
+    {"pane_id":"p10","tab_id":"w1:t10","tokens":{"tab_number":"9"}}
+  ],
+  "agents":[]
+}}}
+JSON
+run_event tab.moved
+out=$(log)
+check_contains "tab token: first pane receives plain number" "$out" \
+  "pane report-metadata p1 --source herdr-automatic-rename --token tab_number=1"
+check_contains "tab token: every pane in tab receives number" "$out" \
+  "pane report-metadata p2 --source herdr-automatic-rename --token tab_number=1"
+check_absent "tab token: correct value is not rewritten" "$out" \
+  "pane report-metadata p3"
+check_contains "tab token: position ten is cleared" "$out" \
+  "pane report-metadata p10 --source herdr-automatic-rename --clear-token tab_number"
+teardown
+
+# ======================================================================
+# Scenario 18: disabling AUTO_INDEX clears any tab-number metadata even when
+#   tab naming is disabled too, without touching unrelated pane tokens.
+# ======================================================================
+setup
+export NAME_TABS=0 AUTO_INDEX=0
+export HERDR_MOCK_VERSION=0.8.0
+fixture workspaces.json <<'JSON'
+{"result":{"workspaces":[{"workspace_id":"w1","label":"api"}]}}
+JSON
+fixture panes.json <<'JSON'
+{"result":{"panes":[
+  {"pane_id":"p1","tab_id":"w1:t1","tokens":{"tab_number":"1"}},
+  {"pane_id":"p2","tab_id":"w1:t2","tokens":{"other":"keep"}}
+]}}
+JSON
+run_event tab.focused
+out=$(log)
+check_contains "tab token: disabling indexing clears token" "$out" \
+  "pane report-metadata p1 --source herdr-automatic-rename --clear-token tab_number"
+check_absent "tab token: unrelated metadata is untouched" "$out" \
+  "pane report-metadata p2"
 teardown
 
 t_summary

@@ -2,7 +2,7 @@
 
 [![tests](https://github.com/qu8n/herdr-automatic-rename/actions/workflows/ci.yml/badge.svg)](https://github.com/qu8n/herdr-automatic-rename/actions/workflows/ci.yml)
 
-Fork of [qu8n/herdr-automatic-rename](https://github.com/qu8n/herdr-automatic-rename), based on version `0.4.0`. Adds cwd-aware tab names.
+Fork of [qu8n/herdr-automatic-rename](https://github.com/qu8n/herdr-automatic-rename), based on version `0.4.0`. Adds cwd-aware tab names and reports each pane's plain 1-9 tab position as `tab_number` metadata for custom agent-sidebar rows. Metadata reporting requires Herdr `>= 0.8.0`.
 
 ## Features
 
@@ -142,10 +142,32 @@ Override the path with `HERDR_AUTOMATIC_RENAME_CONFIG`.
 
 `config.example.sh` documents each with examples.
 
+### Tab numbers in agent rows
+
+On herdr 0.8.0 or newer, `AUTO_INDEX=1` also reports each pane's tab jump
+position as the custom metadata token `$tab_number`. The value is the plain
+number `1` through `9`, independent of the responsive tab label, so an agent row
+can show the compact tab position without repeating names such as
+`nvim:project`:
+
+```toml
+[ui.sidebar.agents]
+rows = [
+  ["state_icon", "workspace", "$tab_number"],
+  ["state_text", "agent"],
+]
+```
+
+Every pane in a tab receives the same token. The plugin skips a pane whose
+cached value is already correct, clears stale values after position 9, and
+clears its own token when `AUTO_INDEX` is disabled or the plugin's `clear`
+action runs. Other pane metadata is untouched. Older herdr releases simply skip
+this reporting and retain their existing rename behavior.
+
 ## Actions
 
 - `reset`: re-adopt a hand-renamed tab.
-- `clear`: strip every `[N]`, restore base names, revert agents to detection.
+- `clear`: strip every `[N]`, clear `$tab_number`, restore base names, and revert agents to detection.
 
 Run from the CLI, or bind a key:
 
@@ -178,7 +200,7 @@ herdr plugin uninstall herdr-automatic-rename
 - **Agent numbering needs herdr `< 0.7.5`.** That release added a name rule (`^[a-z][a-z0-9_-]{0,31}$`) that rejects a bracketed number outright, so newer herdr leaves agent rows alone and strips any prefix an older setup left behind. Where it does apply, it also needs grouped (`spaces`) sort, the mode whose CLI order matches the panel `focus_agent` follows. In `priority` sort that order is API-invisible, so numbers are stripped there too.
 - **Tab names go quiet on Linux runtimes with no foreground process group.** Naming reads the pane's foreground process, and some container and sandbox setups leave herdr unable to see one, which makes tab naming do nothing at all (numbering is unaffected). herdr `>= 0.8.0` has an opt-in fallback: set `HERDR_PROCESS_DETECTION=child-groups` in its environment. It is best-effort by herdr's own account, since in that mode a background job can look like the foreground one, so a tab may occasionally follow the wrong process.
 - **Collapsing a space renumbers.** `alt+N` counts the sidebar's visible rows, so a collapsed space hides its worktree workspaces from numbering and every row below it moves up. The hidden ones go bare until you expand. Focusing one of those worktrees while the space stays collapsed renders that row again, which shifts the rows below it back down. herdr publishes collapse only in `session.json`, on a 5-second debounce and with no event to hook, so the first jump right after a collapse can still use the old numbers.
-- **Stops at 9.** No binding reaches a 10th item, so `10+` stay bare.
+- **Stops at 9.** No binding reaches a 10th item, so `10+` stay bare and do not publish a `$tab_number` value.
 
 ## Development
 
@@ -189,7 +211,8 @@ Engine: `automatic-rename.sh` (bash 3.2, needs only `jq` and the herdr CLI). Pur
 ./tests/run.sh reconcile  # one file
 ```
 
-They cover the naming rules, the `[N]` prefix helpers, the state machine, the shell hooks, and a full reconcile against a fake `herdr`.
+They cover the naming rules, the `[N]` prefix helpers, `$tab_number` metadata,
+the state machine, the shell hooks, and a full reconcile against a fake `herdr`.
 
 ## License
 
