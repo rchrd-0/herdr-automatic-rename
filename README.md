@@ -2,6 +2,8 @@
 
 [![tests](https://github.com/qu8n/herdr-automatic-rename/actions/workflows/ci.yml/badge.svg)](https://github.com/qu8n/herdr-automatic-rename/actions/workflows/ci.yml)
 
+Fork of [qu8n/herdr-automatic-rename](https://github.com/qu8n/herdr-automatic-rename), based on version `0.4.0`. Adds cwd-aware tab names.
+
 ## Features
 
 **1. Automatic tab rename with the foreground process and cwd.** Inspired by [tmux](https://github.com/tmux/tmux)'s `automatic-rename`, each tab shows the active directory at a shell prompt (e.g. `project`) or combines its foreground process with that directory (e.g. `nvim:project`, `codex:project`). Custom renames are respected, and `SHOW_CWD=0` restores the original process/shell-only style.
