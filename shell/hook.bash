@@ -2,7 +2,7 @@
 #
 # herdr has no "foreground command changed" event, so this hook drives the
 # real-time updates: preexec names the tab after the starting command, precmd
-# names it after the shell once back at the prompt. Everything else (tab
+# restores its cwd-aware prompt name once back at the prompt. Everything else (tab
 # switches, numbering, agents) comes from the plugin's herdr [[events]].
 #
 # bash has no native preexec, and the DEBUG trap + PROMPT_COMMAND are SHARED,
@@ -34,8 +34,8 @@ if [[ -n ${HERDR_PANE_ID:-} && -x $_har_bin && -z ${_har_installed:-} ]]; then
   _har_installed=1
 
   # Background in a subshell so bash never prints a "[1] <pid>" job-start line.
-  # preexec's $1 is the command line; precmd passes the shell name ("bash") so a
-  # bare prompt names the tab "bash" regardless of the login shell.
+  # preexec's $1 is the command line. Every call passes the shell's authoritative
+  # $PWD; precmd also passes "bash" so a bare prompt is classified correctly.
   #
   # The first word only names a program when `type -t` says it is a file on
   # disk. bash hands us the RAW line, so aliases, functions, builtins, keywords,
@@ -47,12 +47,12 @@ if [[ -n ${HERDR_PANE_ID:-} && -x $_har_bin && -z ${_har_installed:-} ]]; then
     local word="${1%% *}" kind
     kind=$(type -t -- "$word" 2>/dev/null)
     if [ "$kind" = "file" ]; then
-      ("$_har_bin" preexec "$1"       >/dev/null 2>&1 &)
+      ("$_har_bin" preexec "$1" "$PWD"       >/dev/null 2>&1 &)
     else
-      ("$_har_bin" preexec "$1" shell >/dev/null 2>&1 &)
+      ("$_har_bin" preexec "$1" "$PWD" shell >/dev/null 2>&1 &)
     fi
   }
-  _har_precmd() { ("$_har_bin" precmd bash >/dev/null 2>&1 &); }
+  _har_precmd() { ("$_har_bin" precmd bash "$PWD" >/dev/null 2>&1 &); }
 
   if declare -p preexec_functions >/dev/null 2>&1 || declare -p precmd_functions >/dev/null 2>&1; then
     # A preexec framework (bash-preexec / ble.sh / atuin) owns the trap; just

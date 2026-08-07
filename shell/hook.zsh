@@ -2,7 +2,7 @@
 #
 # herdr has no "foreground command changed" event, so these zsh hooks give the
 # real-time updates: preexec renames the tab after the command that is starting,
-# precmd renames it after the shell name once back at the prompt. The plugin's
+# precmd restores its cwd-aware prompt name once back at the prompt. The plugin's
 # herdr [[events]] handle everything else (tab switches, new tabs, agents,
 # numbering). A lock in the engine keeps the hook and events from racing, and the
 # engine honors the NAME_TABS toggle (this hook stays dumb).
@@ -40,17 +40,17 @@ if [[ -n ${HERDR_PANE_ID:-} && -x $_har_bin ]]; then
   # word: command/hashed keep the instant path, anything else gets a "shell"
   # marker telling the engine to sample the pane's real foreground process.
   #
-  # precmd passes the shell name ("zsh") so a bare prompt names the tab "zsh"
-  # regardless of the login shell.
+  # Every call passes the shell's authoritative $PWD. precmd also passes the
+  # shell name ("zsh") so a bare prompt is classified correctly.
   _har_preexec() {
     local line="${2:-$1}" kind
     kind=$(builtin whence -w -- "${(Q)${(z)line}[1]}" 2>/dev/null)
     case "${kind##*: }" in
-      command|hashed) ("$_har_bin" preexec "$line"       >/dev/null 2>&1 &) ;;
-      *)              ("$_har_bin" preexec "$line" shell >/dev/null 2>&1 &) ;;
+      command|hashed) ("$_har_bin" preexec "$line" "$PWD"       >/dev/null 2>&1 &) ;;
+      *)              ("$_har_bin" preexec "$line" "$PWD" shell >/dev/null 2>&1 &) ;;
     esac
   }
-  _har_precmd() { ("$_har_bin" precmd zsh >/dev/null 2>&1 &); }
+  _har_precmd() { ("$_har_bin" precmd zsh "$PWD" >/dev/null 2>&1 &); }
 
   autoload -Uz add-zsh-hook
   add-zsh-hook preexec _har_preexec   # add-zsh-hook is idempotent on re-source

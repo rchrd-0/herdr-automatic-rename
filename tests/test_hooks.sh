@@ -44,36 +44,39 @@ check "bash: no-ops outside a herdr pane" "unset" "$got"
 clsbox() { # <hook file> -> sets $CLS_SB, $CLS_LOG
   CLS_SB=$(mktemp -d "${TMPDIR:-/tmp}/hal-cls.XXXXXX")
   CLS_LOG="$CLS_SB/args.log"; : >"$CLS_LOG"
+  CLS_CWD="$CLS_SB/cwd with space"; mkdir -p "$CLS_CWD"
+  CLS_CWD=$(cd "$CLS_CWD" && pwd)
   mkdir -p "$CLS_SB/shell"
   cp "$REPO/shell/$1" "$CLS_SB/shell/"
-  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"\n' "$CLS_LOG" >"$CLS_SB/automatic-rename.sh"
+  printf '#!/usr/bin/env bash\nprintf "argc=%%s|1=<%%s>|2=<%%s>|3=<%%s>|4=<%%s>\\n" "$#" "${1-}" "${2-}" "${3-}" "${4-}" >> "%s"\n' "$CLS_LOG" >"$CLS_SB/automatic-rename.sh"
   chmod +x "$CLS_SB/automatic-rename.sh"
 }
-clswait() { # poll until the log has 2 lines (or ~1s passes)
+clswait() { # [line count] -- poll until the log is complete (or ~1s passes)
+  local want=${1:-3}
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    [ "$(grep -c . "$CLS_LOG" 2>/dev/null)" -ge 2 ] && break
+    [ "$(grep -c . "$CLS_LOG" 2>/dev/null)" -ge "$want" ] && break
     sleep 0.05
   done
   cat "$CLS_LOG"
 }
 
 clsbox hook.bash
-HERDR_PANE_ID=x HAL_HOOK="$CLS_SB/shell/hook.bash" /usr/bin/env bash -c \
-  'source "$HAL_HOOK"; l() { :; }; _har_preexec "l"; _har_preexec "ls -a"; wait' 2>/dev/null
+HERDR_PANE_ID=x HAL_HOOK="$CLS_SB/shell/hook.bash" HAL_CWD="$CLS_CWD" /usr/bin/env bash -c \
+  'source "$HAL_HOOK"; cd "$HAL_CWD"; l() { :; }; _har_preexec "l"; _har_preexec "ls -a"; _har_precmd; wait' 2>/dev/null
 got=$(clswait)
-check_contains "bash: function word marked shell"     "$got" "preexec l shell"
-check_contains "bash: external command left instant"  "$got" "preexec ls -a"
-check_absent   "bash: external command not marked"    "$got" "preexec ls -a shell"
+check_contains "bash: function passes cwd + shell marker" "$got" "argc=4|1=<preexec>|2=<l>|3=<$CLS_CWD>|4=<shell>"
+check_contains "bash: external passes cwd" "$got" "argc=3|1=<preexec>|2=<ls -a>|3=<$CLS_CWD>|4=<>"
+check_contains "bash: precmd passes cwd" "$got" "argc=3|1=<precmd>|2=<bash>|3=<$CLS_CWD>|4=<>"
 rm -rf "$CLS_SB"
 
 if command -v zsh >/dev/null 2>&1; then
   clsbox hook.zsh
-  HERDR_PANE_ID=x HAL_HOOK="$CLS_SB/shell/hook.zsh" zsh -c \
-    'source "$HAL_HOOK"; function l() { :; }; _har_preexec l l l; _har_preexec "ls -a" "ls -a" "ls -a"; wait' 2>/dev/null
+  HERDR_PANE_ID=x HAL_HOOK="$CLS_SB/shell/hook.zsh" HAL_CWD="$CLS_CWD" zsh -c \
+    'source "$HAL_HOOK"; cd "$HAL_CWD"; function l() { :; }; _har_preexec l l l; _har_preexec "ls -a" "ls -a" "ls -a"; _har_precmd; wait' 2>/dev/null
   got=$(clswait)
-  check_contains "zsh: function word marked shell"    "$got" "preexec l shell"
-  check_contains "zsh: external command left instant" "$got" "preexec ls -a"
-  check_absent   "zsh: external command not marked"   "$got" "preexec ls -a shell"
+  check_contains "zsh: function passes cwd + shell marker" "$got" "argc=4|1=<preexec>|2=<l>|3=<$CLS_CWD>|4=<shell>"
+  check_contains "zsh: external passes cwd" "$got" "argc=3|1=<preexec>|2=<ls -a>|3=<$CLS_CWD>|4=<>"
+  check_contains "zsh: precmd passes cwd" "$got" "argc=3|1=<precmd>|2=<zsh>|3=<$CLS_CWD>|4=<>"
   rm -rf "$CLS_SB"
 else
   echo "# skip: zsh not installed"
@@ -85,12 +88,12 @@ fi
 # portable across NixOS (no /bin) and standard Linux.
 if command -v fish >/dev/null 2>&1; then
   clsbox hook.fish
-  HERDR_PANE_ID=x HAL_HOOK="$CLS_SB/shell/hook.fish" fish -c \
-    'source "$HAL_HOOK"; function l; end; _har_preexec "l"; _har_preexec "/usr/bin/env -a"' 2>/dev/null
+  HERDR_PANE_ID=x HAL_HOOK="$CLS_SB/shell/hook.fish" HAL_CWD="$CLS_CWD" fish -c \
+    'source "$HAL_HOOK"; cd "$HAL_CWD"; function l; end; _har_preexec "l"; _har_preexec "/usr/bin/env -a"; _har_precmd' 2>/dev/null
   got=$(clswait)
-  check_contains "fish: function word marked shell"    "$got" "preexec l shell"
-  check_contains "fish: external command left instant" "$got" "preexec /usr/bin/env -a"
-  check_absent   "fish: external command not marked"   "$got" "preexec /usr/bin/env -a shell"
+  check_contains "fish: function passes cwd + shell marker" "$got" "argc=4|1=<preexec>|2=<l>|3=<$CLS_CWD>|4=<shell>"
+  check_contains "fish: external passes cwd" "$got" "argc=3|1=<preexec>|2=</usr/bin/env -a>|3=<$CLS_CWD>|4=<>"
+  check_contains "fish: precmd passes cwd" "$got" "argc=3|1=<precmd>|2=<fish>|3=<$CLS_CWD>|4=<>"
   rm -rf "$CLS_SB"
 else
   echo "# skip: fish not installed (classification)"

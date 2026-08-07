@@ -6,9 +6,10 @@
 # the literal word "l". No program list can match a function name, so the tab
 # flashed "l" and precmd snapped it back -- a flicker on every instant function.
 # The hooks now classify the command word; anything that is not an external
-# command gets a "shell" third argument, and the engine names the tab by the
+# command gets a trailing "shell" marker, and the engine names the tab by the
 # pane's REAL foreground process (sampled after a short settle) instead of by
-# the typed word.
+# the typed word. New hook calls place cwd before that marker; the legacy form
+# without cwd remains supported.
 
 set -o pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -156,6 +157,38 @@ printf '{"t1":{"auto":"","enabled":true}}\n' \
   >"$XDG_STATE_HOME/herdr-automatic-rename/state.json"
 /usr/bin/env bash "$ENGINE" precmd zsh
 check "hidden tab: no repeat rename" "" "$(log)"
+teardown
+
+# ======================================================================
+# Scenario 7: new fast-path calls pass the shell's cwd directly.
+# ======================================================================
+setup
+/usr/bin/env bash "$ENGINE" preexec "nvim README.md" "/Users/test/code/foo"
+check "preexec: appends shell cwd" "tab rename t1 [1] nvim:foo" "$(log)"
+teardown
+
+# A prompt update uses the shell's current directory even with HIDE_SHELL on;
+# this is the path that updates the name after `cd`.
+setup
+export HIDE_SHELL=1
+fixture tab_t1.json <<'JSON'
+{"result":{"tab":{"tab_id":"t1","label":"[1] nvim"}}}
+JSON
+printf '{"t1":{"auto":"nvim","enabled":true}}\n' \
+  >"$XDG_STATE_HOME/herdr-automatic-rename/state.json"
+/usr/bin/env bash "$ENGINE" precmd zsh "/Users/test/code/foo"
+check "precmd: current cwd replaces shell" "tab rename t1 [1] foo" "$(log)"
+teardown
+
+# The new sampled form carries cwd before the shell marker. The legacy marker
+# form remains covered by scenarios 1-3 above.
+setup
+fixture procinfo_p1.json <<'JSON'
+{"result":{"process_info":{"foreground_process_group_id":200,
+  "foreground_processes":[{"pid":200,"argv0":"nvim","cmdline":"nvim README.md"}]}}}
+JSON
+/usr/bin/env bash "$ENGINE" preexec "v" "/Users/test/code/foo" shell
+check "sampled preexec: appends shell cwd" "tab rename t1 [1] nvim:foo" "$(log)"
 teardown
 
 t_summary

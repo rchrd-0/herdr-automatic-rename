@@ -21,8 +21,8 @@
 #
 # Invoked several ways, all routing through ar_run:
 #   * herdr [[events]] hooks:     automatic-rename.sh <event.name>
-#   * shell preexec/precmd hooks: automatic-rename.sh preexec "<cmdline>"
-#                                 automatic-rename.sh precmd [<shell-name>]
+#   * shell preexec/precmd hooks: automatic-rename.sh preexec "<cmdline>" "<cwd>" [shell]
+#                                 automatic-rename.sh precmd [<shell-name>] [<cwd>]
 #   * the "reset" action:         automatic-rename.sh reset      (re-adopt active tab)
 #   * the "clear" action:         automatic-rename.sh --clear    (strip all prefixes)
 #
@@ -782,8 +782,9 @@ ar_reconcile() {
 }
 
 # Fast path for the shell hooks: rename only the current tab (no cross-tab work).
-# preexec passes the command line; precmd (back at the prompt) names by the shell.
-# Preserves the existing "[N]" prefix when AUTO_INDEX is on, drops it when off.
+# Both hook modes pass the shell's cwd. preexec also passes the command line;
+# precmd classifies the result as a shell prompt. Preserves the existing "[N]"
+# prefix when AUTO_INDEX is on, drops it when off.
 #
 # preexec has two modes. Default: trust the command line's first word as the
 # program (accurate for external commands and expanded aliases). Sampled
@@ -796,7 +797,7 @@ ar_reconcile() {
 ar_fast_once() {
   local tab="${HERDR_TAB_ID:-}"
   [ -n "$tab" ] || return 0
-  local prog="" cmd="" info name label raw prefix slabel enabled auto want
+  local prog="" cmd="" cwd="${AR_FAST_CWD:-}" info name label raw prefix slabel enabled auto want
   if [ "$MODE" = "preexec" ]; then
     if [ "${AR_FAST_SAMPLE:-}" = "1" ]; then
       info=$(ar_pane_program "${HERDR_PANE_ID:-}") || return 0
@@ -807,7 +808,7 @@ ar_fast_once() {
       prog="${cmd%% *}"; prog="${prog##*/}"
     fi
   fi
-  name=$(ar_format "$prog" "$cmd")
+  name=$(ar_format "$prog" "$cmd" "$cwd")
   # A failed `tab get` must NOT look like an empty label (which would read as a
   # placeholder and clobber a hand-picked name). Only proceed on a real tab object.
   raw=$("$HERDR" tab get "$tab" 2>/dev/null) || return 0
@@ -884,25 +885,32 @@ ar_main() {
     preexec)
       [ "$NAME_TABS" = "1" ] || exit 0
       AR_FAST_ARG="${2:-}"                    # the command line being run
-      # $3 = "shell": the hook resolved the command word to a shell construct
+      AR_FAST_CWD=""
+      # New callers pass cwd as $3 and the optional "shell" marker as $4. Keep
+      # accepting the legacy `preexec <cmdline> shell` form with no cwd.
+      if [ "${3:-}" = "shell" ] && [ -z "${4:-}" ]; then
+        AR_FAST_SAMPLE=1
+      else
+        AR_FAST_CWD="${3:-}"
+        [ "${4:-}" = "shell" ] && AR_FAST_SAMPLE=1
+      fi
+      # "shell" means the hook resolved the command word to a shell construct
       # (function/builtin/reserved/typo), which never becomes the foreground
       # process. Give the construct a moment to finish or spawn its real
       # program, then name by what actually holds the pane (see ar_fast_once).
       # The settle sleep runs BEFORE ar_run so the lock is never held asleep.
-      if [ "${3:-}" = "shell" ]; then
-        AR_FAST_SAMPLE=1
+      if [ "${AR_FAST_SAMPLE:-}" = "1" ]; then
         sleep 0.2 2>/dev/null || true
       fi
       ar_run fast
       ;;
     precmd)
       [ "$NAME_TABS" = "1" ] || exit 0
-      # Optional 2nd arg = the calling shell's own name, so a bare prompt in a
-      # bash/fish pane reads "bash"/"fish" instead of $SHELL (the login shell).
-      # Absent (a bare `precmd` from an older caller) -> keep the SHELL_NAME
-      # default from naming.sh/config. ar_format returns SHELL_NAME for an empty
-      # program, which is exactly the bare-prompt case the precmd fast path hits.
+      # Optional $2 is the calling shell's own name, and optional $3 is its cwd.
+      # An older caller can omit either; then the formatter keeps its configured
+      # shell label and/or simply has no cwd component.
       [ -n "${2:-}" ] && SHELL_NAME="$2"
+      AR_FAST_CWD="${3:-}"
       ar_run fast
       ;;
     reset)
