@@ -191,4 +191,53 @@ JSON
 check "sampled preexec: appends shell cwd" "tab rename t1 [1] nvim:foo" "$(log)"
 teardown
 
+# A fast prompt rename emits tab.renamed. Herdr may still report the previous
+# foreground_cwd until focus changes, so that self-event must not reconcile the
+# authoritative hook label back to the stale directory.
+setup
+fixture tab_t1.json <<'JSON'
+{"result":{"tab":{"tab_id":"t1","label":"[1] zsh"}}}
+JSON
+/usr/bin/env bash "$ENGINE" precmd zsh "/Users/test/code/new"
+check "cwd race: fast path writes new directory" "tab rename t1 [1] new" "$(log)"
+
+fixture tab_t1.json <<'JSON'
+{"result":{"tab":{"tab_id":"t1","label":"[1] new"}}}
+JSON
+fixture workspaces.json <<'JSON'
+{"result":{"workspaces":[{"workspace_id":"w1","label":"code"}]}}
+JSON
+fixture tabs_w1.json <<'JSON'
+{"result":{"tabs":[{"tab_id":"t1","label":"[1] new","pane_count":1,"focused":true}]}}
+JSON
+fixture panes.json <<'JSON'
+{"result":{"panes":[{"pane_id":"p1","tab_id":"t1","focused":true,"foreground_cwd":"/Users/test/code/old"}]}}
+JSON
+fixture procinfo_p1.json <<'JSON'
+{"result":{"process_info":{"foreground_process_group_id":100,
+  "foreground_processes":[{"pid":100,"argv0":"-zsh","cmdline":"-zsh"}]}}}
+JSON
+/usr/bin/env bash "$ENGINE" tab.renamed
+check "cwd race: self-event keeps authoritative hook cwd" \
+  "tab rename t1 [1] new" "$(log)"
+teardown
+
+# A genuine manual rename still runs the full ownership state machine and opts
+# the tab out; only labels matching our recorded auto-name are suppressed.
+setup
+fixture tab_t1.json <<'JSON'
+{"result":{"tab":{"tab_id":"t1","label":"[1] notes"}}}
+JSON
+fixture workspaces.json <<'JSON'
+{"result":{"workspaces":[{"workspace_id":"w1","label":"[1] code"}]}}
+JSON
+fixture tabs_w1.json <<'JSON'
+{"result":{"tabs":[{"tab_id":"t1","label":"[1] notes","pane_count":1,"focused":true}]}}
+JSON
+/usr/bin/env bash "$ENGINE" tab.renamed
+check "manual rename event: tab opts out" "false" \
+  "$(jq -r '.t1.enabled' "$XDG_STATE_HOME/herdr-automatic-rename/state.json")"
+check "manual rename event: label is preserved" "" "$(log)"
+teardown
+
 t_summary

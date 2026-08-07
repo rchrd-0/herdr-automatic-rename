@@ -81,8 +81,10 @@ command = ["bash", "automatic-rename.sh", "tab.created"]
 on = "tab.closed"
 command = ["bash", "automatic-rename.sh", "tab.closed"]
 
-# Re-apply on a user rename (alt+r). Our own rename also re-fires this; the
-# idempotent skip-if-correct guard stops the loop.
+# Re-apply on a user rename (alt+r). Our own rename also re-fires this, but the
+# engine recognizes its recorded base and returns before a full reconcile. That
+# matters for shell-hook renames because Herdr's foreground_cwd can lag $PWD
+# until focus changes.
 [[events]]
 on = "tab.renamed"
 command = ["bash", "automatic-rename.sh", "tab.renamed"]

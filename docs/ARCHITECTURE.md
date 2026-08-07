@@ -18,8 +18,10 @@ pane's foreground process.
 
 Computing a tab's name and its `[N]` prefix in the same pass is what lets a
 brand-new tab settle at `[3] project` in a single rename. Every rename is
-skip-if-correct, so re-firing the pass (herdr's own rename re-emits
-`tab.renamed`) changes nothing and cannot loop.
+skip-if-correct. A tab rename also emits `tab.renamed`; the event handler compares
+the current base with the recorded auto-name and skips a full pass when they
+match. A different base is a manual edit and still runs the ownership state
+machine.
 
 ## Naming lives in a pure module
 
@@ -42,7 +44,10 @@ to both preexec and prompt/postexec calls. The prompt callback runs after `cd`,
 so it updates the directory label immediately without a separate chdir hook.
 These values can briefly differ by design: Herdr's `foreground_cwd` follows the
 foreground process when resolvable, while the hook value is the shell's cwd at
-the moment the hook fires.
+the moment the hook fires. In particular, `foreground_cwd` can retain the old
+directory until focus changes after `cd`. The hook records its new base before
+renaming, so the resulting `tab.renamed` event is recognized as self-generated
+and cannot immediately reconcile the label back to stale pane data.
 
 ## Why config and state sit at fixed paths
 

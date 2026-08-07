@@ -221,6 +221,25 @@ ar_state_prune() { # <keep tab_ids...> - drop entries for tabs that no longer ex
   fi
 }
 
+# ar_tab_rename_is_owned <tab_id> -> true when the tab's current base is the
+# auto-name already recorded in state. Used to ignore tab.renamed events emitted
+# by our own rename calls, which would otherwise immediately reconcile against
+# pane cwd data that can lag the shell hook until focus changes.
+ar_tab_rename_is_owned() {
+  local tab=$1 enabled auto raw label base
+  [ -n "$tab" ] || return 1
+  enabled=$(ar_state_get "$tab" enabled)
+  [ "$enabled" = "true" ] || return 1
+  auto=$(ar_state_get "$tab" auto)
+  raw=$("$HERDR" tab get "$tab" 2>/dev/null) || return 1
+  [ -n "$raw" ] || return 1
+  printf '%s' "$raw" | jq -e '(.result.tab // .tab) | has("label")' >/dev/null 2>&1 || return 1
+  label=$(printf '%s' "$raw" | jq -r '(.result.tab // .tab).label // ""' 2>/dev/null)
+  base=$(ar_strip_prefix "$label")
+  [ "$base" = "$auto" ] && return 0
+  [ -z "$auto" ] && ar_is_placeholder "$base"
+}
+
 # ar_name_eligible <tab_id> <base label, prefix already stripped>
 # The manual-rename exclusion state machine. Returns 0 (eligible for auto-naming)
 # or 1 (leave the base alone). May write opt-out state as a side effect. Needs no
@@ -799,7 +818,7 @@ ar_reconcile() {
 ar_fast_once() {
   local tab="${HERDR_TAB_ID:-}"
   [ -n "$tab" ] || return 0
-  local prog="" cmd="" cwd="${AR_FAST_CWD:-}" info name label raw prefix slabel enabled auto want
+  local prog="" cmd="" cwd="${AR_FAST_CWD:-}" info name label raw prefix slabel enabled auto want old_auto old_enabled
   if [ "$MODE" = "preexec" ]; then
     if [ "${AR_FAST_SAMPLE:-}" = "1" ]; then
       info=$(ar_pane_program "${HERDR_PANE_ID:-}") || return 0
@@ -829,9 +848,23 @@ ar_fast_once() {
   fi
   want="${prefix}${name}"
   if [ "$want" != "$label" ]; then
-    "$HERDR" tab rename "$tab" "$want" >/dev/null 2>&1 || return 0
+    # Record ownership before asking herdr to rename. tab rename emits
+    # tab.renamed before this command necessarily returns; the event handler can
+    # now recognize our label and avoid a stale-cwd reconcile. Roll state back if
+    # the rename itself fails.
+    old_auto=$(ar_state_get "$tab" auto)
+    old_enabled=$(ar_state_get "$tab" enabled)
+    ar_state_set "$tab" "$name" true
+    if ! "$HERDR" tab rename "$tab" "$want" >/dev/null 2>&1; then
+      case "$old_enabled" in
+        true|false) ar_state_set "$tab" "$old_auto" "$old_enabled" ;;
+        *)          ar_state_del "$tab" ;;
+      esac
+      return 0
+    fi
+  else
+    ar_state_set "$tab" "$name" true
   fi
-  ar_state_set "$tab" "$name" true
 }
 
 # Coalesce bursts: only the lock holder works; contenders raise the rerun flag
@@ -932,6 +965,13 @@ ar_main() {
       ;;
     clear|--clear)
       ar_run full                            # CLEAR=1 already set above
+      ;;
+    tab.renamed)
+      # Every automatic tab rename emits this event. If the current base still
+      # matches our recorded auto-name, it is our own idempotent notification,
+      # not a manual edit, and a full reconcile can only add latency (or replace
+      # a fresh hook-provided cwd with Herdr's temporarily stale foreground_cwd).
+      ar_tab_rename_is_owned "${HERDR_TAB_ID:-}" || ar_run full
       ;;
     tab.closed)
       ar_wait_tab_gone "${HERDR_TAB_ID:-}"   # settle before the reconcile
