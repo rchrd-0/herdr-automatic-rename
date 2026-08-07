@@ -96,9 +96,11 @@ Each hook classifies the command word (`whence -w` in zsh, `type -t` in bash,
 else gets a `shell` marker, and the engine sleeps 0.2 s (before taking the
 lock), then names the tab by the pane's actual foreground process via
 `pane process-info`. An instant construct has exited by then, so the leader is
-the shell again and nothing is renamed. A construct that wraps a long-running
-program gets that program's real name, which the typed word never was. When
-sampling fails the engine renames nothing rather than guess.
+the shell again and nothing is renamed; precmd owns the prompt label. This is
+load-bearing for `cd`, because the delayed preexec worker captured the old
+`$PWD` and can finish after precmd has already written the new one. A construct
+that wraps a long-running program gets that program's real name, which the typed
+word never was. When sampling fails the engine renames nothing rather than guess.
 
 ## Numbering caveats
 

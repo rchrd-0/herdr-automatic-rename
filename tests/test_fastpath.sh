@@ -240,4 +240,22 @@ check "manual rename event: tab opts out" "false" \
 check "manual rename event: label is preserved" "" "$(log)"
 teardown
 
+# `cd` is sampled as a shell construct. Its delayed preexec worker carries the
+# old cwd and can finish after precmd has already written the new cwd. When the
+# sampled foreground process is only the shell, it must not overwrite that
+# newer prompt label.
+setup
+fixture tab_t1.json <<'JSON'
+{"result":{"tab":{"tab_id":"t1","label":"[1] new"}}}
+JSON
+printf '{"t1":{"auto":"new","enabled":true}}\n' \
+  >"$XDG_STATE_HOME/herdr-automatic-rename/state.json"
+fixture procinfo_p1.json <<'JSON'
+{"result":{"process_info":{"foreground_process_group_id":100,
+  "foreground_processes":[{"pid":100,"argv0":"-zsh","cmdline":"-zsh"}]}}}
+JSON
+/usr/bin/env bash "$ENGINE" preexec "cd new" "/Users/test/code/old" shell
+check "cd race: delayed sampled shell keeps newer prompt cwd" "" "$(log)"
+teardown
+
 t_summary

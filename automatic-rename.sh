@@ -824,6 +824,11 @@ ar_fast_once() {
       info=$(ar_pane_program "${HERDR_PANE_ID:-}") || return 0
       IFS=$'\t' read -r prog cmd <<< "$info"
       [ -n "$prog" ] || return 0
+      # A sampled shell means the construct already finished without leaving a
+      # foreground program. Do nothing and let precmd own the prompt label. This
+      # is especially important for `cd`: this delayed worker carries preexec's
+      # old cwd and may finish after precmd has written the new one.
+      ar_in_list "$prog" "${SHELLS[@]}" && return 0
     else
       cmd="${AR_FAST_ARG:-}"
       prog="${cmd%% *}"; prog="${prog##*/}"
