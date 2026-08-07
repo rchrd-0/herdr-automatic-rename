@@ -14,10 +14,25 @@ check "bare prompt -> shell name"      "zsh"  "$(ar_format '' '')"
 check "explicit shell shows own name"  "bash" "$(ar_format 'bash' 'bash')"
 check "fish shell name"                "fish" "$(ar_format 'fish' '')"
 
+# Cwd display replaces the shell component at a prompt.
+check "shell with cwd -> directory" "foo" \
+  "$(SHOW_CWD=1 ar_format 'zsh' '-zsh' '/Users/test/code/foo')"
+check "cwd renderer strips trailing slash" "foo" \
+  "$(ar_cwd_basename '/Users/test/code/foo/')"
+check "cwd renderer preserves root" "/" "$(ar_cwd_basename '/')"
+check "cwd renderer abbreviates home" "~" "$(HOME=/Users/test ar_cwd_basename '/Users/test')"
+check "cwd renderer handles empty cwd" "" "$(ar_cwd_basename '')"
+
 # ---- name-only programs (editors, agents, git) ----
 check "nvim is name-only"    "nvim"   "$(ar_format 'nvim' 'nvim README.md')"
 check "claude is name-only"  "claude" "$(ar_format 'claude' 'claude --dangerously-skip-permissions')"
 check "git is name-only"     "git"    "$(ar_format 'git' 'git status')"
+check "nvim with cwd -> program:directory" "nvim:foo" \
+  "$(SHOW_CWD=1 ar_format 'nvim' 'nvim README.md' '/Users/test/code/foo')"
+check "codex with cwd -> program:directory" "codex:foo" \
+  "$(SHOW_CWD=1 ar_format 'codex' 'codex' '/Users/test/code/foo')"
+check "SHOW_CWD disabled preserves program name" "nvim" \
+  "$(SHOW_CWD=0 ar_format 'nvim' 'nvim README.md' '/Users/test/code/foo')"
 
 # NAME_ONLY_PROGRAMS only bites with SHOW_PROGRAM_ARGS=1 (0 is the default and
 # already renders bare names), so assert these there. Covers the agents herdr
@@ -32,6 +47,8 @@ check "gemini is name-only"      "gemini"       "$(SHOW_PROGRAM_ARGS=1 ar_format
 # ---- ignored programs keep showing the shell ----
 check "ls is ignored -> shell" "zsh" "$(ar_format 'ls' 'ls -la')"
 check "cd is ignored -> shell" "zsh" "$(ar_format 'cd' 'cd ..')"
+check "ignored command with cwd -> directory" "foo" \
+  "$(SHOW_CWD=1 ar_format 'ls' 'ls -la' '/Users/test/code/foo')"
 
 # ---- regular programs show their command line (SHOW_PROGRAM_ARGS default on) ----
 SHOW_PROGRAM_ARGS=1
@@ -51,6 +68,8 @@ check "ipython3 collapse"      "ipython3" "$(ar_format 'ipython3' '/usr/bin/ipyt
 # ---- truncation (MAX_NAME_LEN), counted by codepoint ----
 check "truncates to MAX_NAME_LEN" "12345678901234567890" \
   "$(MAX_NAME_LEN=20 ar_format 'x' '123456789012345678901234567890')"
+check "truncates combined cwd-aware label" "nvim:foo" \
+  "$(SHOW_CWD=1 MAX_NAME_LEN=8 ar_format 'nvim' 'nvim README.md' '/Users/test/code/foobar')"
 # A multibyte string must be cut on a codepoint boundary, never mid-byte.
 check "multibyte truncation is clean" "ünïcödé" \
   "$(MAX_NAME_LEN=7 ar_format 'x' 'ünïcödéxxxxxxx')"
@@ -109,6 +128,8 @@ check "icon style 'name_and_icon' is icon+name" "$g_git git" \
   "$(ICONS_ENABLED=1 ICON_STYLE=name_and_icon ar_format 'git' 'git status')"
 check "icon style 'icon' is glyph only" "$g_nvim" \
   "$(ICONS_ENABLED=1 ICON_STYLE=icon ar_format 'nvim' 'nvim')"
+check "icon-only label keeps cwd suffix" "$g_nvim:foo" \
+  "$(ICONS_ENABLED=1 ICON_STYLE=icon SHOW_CWD=1 ar_format 'nvim' 'nvim' '/Users/test/code/foo')"
 check "icon style 'name' suppresses glyph" "nvim" \
   "$(ICONS_ENABLED=1 ICON_STYLE=name ar_format 'nvim' 'nvim')"
 
@@ -124,13 +145,17 @@ check "icons on, unknown program -> plain name" "htop" \
 check "icon+name truncates on codepoint boundary" "$g_node node" \
   "$(ICONS_ENABLED=1 MAX_NAME_LEN=6 SHOW_PROGRAM_ARGS=1 ar_format 'node' 'nodeandmore')"
 
-# ---- HIDE_SHELL: every shell-ish case names the tab nothing (issue #5) ----
-# The empty label is what makes herdr fall back to rendering its own tab number,
-# so these must be EMPTY strings, not $SHELL_NAME and not a space.
+# ---- HIDE_SHELL: suppress the shell component (issue #5) ----
+# Without cwd the empty label still hands the tab back to herdr. With cwd
+# display enabled, the independent directory component remains visible.
 check "hide_shell bare prompt"    "" "$(HIDE_SHELL=1 ar_format '' '')"
 check "hide_shell explicit fish"  "" "$(HIDE_SHELL=1 ar_format 'fish' '-fish')"
 check "hide_shell explicit bash"  "" "$(HIDE_SHELL=1 ar_format 'bash' 'bash')"
 check "hide_shell ignored ls"     "" "$(HIDE_SHELL=1 ar_format 'ls' 'ls -la')"
+check "hide_shell keeps cwd" "foo" \
+  "$(HIDE_SHELL=1 SHOW_CWD=1 ar_format 'zsh' '-zsh' '/Users/test/code/foo')"
+check "hide_shell ignored command keeps cwd" "foo" \
+  "$(HIDE_SHELL=1 SHOW_CWD=1 ar_format 'ls' 'ls -la' '/Users/test/code/foo')"
 # Only shells are hidden: a real program is named exactly as before.
 check "hide_shell keeps nvim"     "nvim" "$(HIDE_SHELL=1 ar_format 'nvim' 'nvim README.md')"
 check "hide_shell keeps program"  "htop" "$(HIDE_SHELL=1 SHOW_PROGRAM_ARGS=0 ar_format 'htop' 'htop -d 5')"
@@ -141,6 +166,8 @@ check "hide_shell keeps alias on a shell" "sh" \
 check "hide_shell off -> shell name" "zsh" "$(HIDE_SHELL=0 ar_format '' '')"
 got=$(bash -c 'SHELL_NAME=zsh; . "$1"; ar_format "" ""' _ "$here/../naming.sh")
 check "HIDE_SHELL defaults to off" "zsh" "$got"
+got=$(bash -c 'HOME=/Users/test; SHELL_NAME=zsh; . "$1"; ar_format zsh zsh /Users/test' _ "$here/../naming.sh")
+check "SHOW_CWD defaults to on" "~" "$got"
 
 # ---- default: SHOW_PROGRAM_ARGS defaults to 0 (regular program -> name only) ----
 got=$(bash -c 'SHELL_NAME=zsh; . "$1"; ar_format htop "htop -d 5"' _ "$here/../naming.sh")

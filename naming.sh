@@ -8,8 +8,8 @@
 #
 # Naming rule: a tab is named after its foreground program (nvim, claude, git,
 # ...). At a bare prompt, or while a quick throwaway command runs, it shows the
-# shell name (e.g. zsh) instead -- or nothing at all with HIDE_SHELL=1. Loosely
-# modeled on tmux-window-name, minus the directory-based naming.
+# shell name (e.g. zsh) instead. With SHOW_CWD=1 the cwd basename replaces that
+# shell component or follows a program label. Loosely modeled on tmux-window-name.
 #
 # Every list below is guarded with `declare -p` rather than `${VAR+x}`, so
 # clearing one in config.sh (e.g. IGNORED_PROGRAMS=()) actually takes effect:
@@ -18,6 +18,7 @@
 # ---- configurable knobs (override in config.sh / $HERDR_AUTOMATIC_RENAME_CONFIG) ----
 : "${MAX_NAME_LEN:=20}"        # truncate the final label to this many chars
 : "${SHOW_PROGRAM_ARGS:=0}"   # 1 = regular programs show their full command line; 0 = name only
+: "${SHOW_CWD:=1}"            # 1 = include the active pane's cwd basename in the label
 : "${ICONS_ENABLED:=0}"       # prepend a Nerd Font glyph (needs a Nerd Font)
 : "${ICON_STYLE:=name_and_icon}"  # name_and_icon (icon+name) | name (name only) | icon (icon only)
 
@@ -75,6 +76,17 @@ ar_in_list() {
   return 1
 }
 
+# ar_cwd_basename <cwd> -> the final path component, or empty when unavailable.
+ar_cwd_basename() {
+  local cwd=$1 home=${HOME:-}
+  [ -n "$cwd" ] || return 0
+  while [ "$cwd" != "/" ] && [ "${cwd%/}" != "$cwd" ]; do cwd=${cwd%/}; done
+  while [ "$home" != "/" ] && [ "${home%/}" != "$home" ]; do home=${home%/}; done
+  [ -n "$home" ] && [ "$cwd" = "$home" ] && { printf '~'; return 0; }
+  [ "$cwd" = "/" ] && { printf '/'; return 0; }
+  printf '%s' "${cwd##*/}"
+}
+
 # ar_alias <program> -> its PROGRAM_ALIASES label, or empty when unaliased.
 ar_alias() {
   local n=$1 pair
@@ -126,10 +138,10 @@ ar_icon() {
   esac
 }
 
-# ar_format <program|""> <cmdline> -> final tab label
+# ar_format <program|""> <cmdline> [cwd] -> final tab label
 #   program == "" means a bare prompt (name by the shell).
 ar_format() {
-  local prog=$1 cmdline=$2 name="" ic aliased is_shell=0
+  local prog=$1 cmdline=$2 cwd=${3:-} cwd_name="" name="" ic aliased is_shell=0
   aliased=$(ar_alias "$prog")
   if [ -z "$prog" ]; then
     name=$SHELL_NAME; is_shell=1
@@ -147,10 +159,15 @@ ar_format() {
     name="$(ar_subst "$prog")"
   fi
 
-  # HIDE_SHELL: drop the shell label entirely and let herdr number the tab. An
-  # explicit PROGRAM_ALIASES entry for a shell (e.g. "fish=sh") is a name the
-  # user asked for by hand, so it survives; nothing else about a shell tab does.
-  if [ "${HIDE_SHELL:-0}" = "1" ] && [ "$is_shell" = "1" ]; then
+  if [ "${SHOW_CWD:-1}" = "1" ]; then
+    cwd_name=$(ar_cwd_basename "$cwd")
+    [ -n "$cwd_name" ] && [ "$is_shell" = "1" ] && name=$cwd_name
+  fi
+
+  # HIDE_SHELL: drop the shell component, but keep an independent cwd label when
+  # one is available. An explicit PROGRAM_ALIASES entry for a shell (e.g.
+  # "fish=sh") is a name the user asked for by hand, so it survives too.
+  if [ "${HIDE_SHELL:-0}" = "1" ] && [ "$is_shell" = "1" ] && [ -z "$cwd_name" ]; then
     printf ''
     return 0
   fi
@@ -164,6 +181,10 @@ ar_format() {
         name_and_icon|*) name="$ic $name" ;;  # icon + name (default)
       esac
     fi
+  fi
+
+  if [ -n "$cwd_name" ] && [ "$is_shell" != "1" ]; then
+    name="$name:$cwd_name"
   fi
 
   # Truncate by Unicode codepoint, not byte. bash's ${#name} / ${name:0:$max}
