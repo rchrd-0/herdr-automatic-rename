@@ -7,8 +7,8 @@
 
 # ---- feature toggles (both default on) ----
 
-# Auto-name each tab after its foreground program (the shell name at a bare
-# prompt). Set to 0 to leave tab names alone.
+# Auto-name each tab from its foreground program and, with SHOW_CWD enabled, its
+# cwd basename. Set to 0 to leave tab names alone.
 # NAME_TABS=1
 
 # Prefix workspaces and tabs with their 1-9 jump-key number, e.g. "[2] api". Set
@@ -23,28 +23,33 @@
 # name ("psql"). Default 0.
 # SHOW_PROGRAM_ARGS=0
 
+# 1 = include the active pane's cwd basename. Shell prompts show only the
+# directory ("project"); programs append it with a colon ("nvim:project").
+# Set to 0 for the original shell/program-only naming behavior. Default 1.
+# SHOW_CWD=1
+
 # Truncate the final label to this many characters (counted by codepoint).
 # MAX_NAME_LEN=20
 
-# Name shown at a bare prompt. Defaults to your $SHELL's basename.
+# Shell fallback used when cwd is unavailable. Defaults to $SHELL's basename.
 # SHELL_NAME=zsh
 
-# 1 = don't name a shell tab at all: a bare prompt, an explicit shell, and an
-# IGNORED_PROGRAMS command all leave the label empty, and herdr shows its own tab
-# number there instead of "zsh". With AUTO_INDEX=1 the label keeps the jump number
-# alone ("[3]"). Programs are named as usual either way.
+# 1 = suppress the shell component at a bare prompt, for an explicit shell, and
+# for an IGNORED_PROGRAMS command. With SHOW_CWD=1 the directory remains visible;
+# without a cwd component the label is empty and herdr shows its own tab number
+# (or the jump number alone, "[3]", with AUTO_INDEX=1). Programs are unchanged.
 # HIDE_SHELL=0
 
-# Programs that count as "a shell prompt" and are shown by their own name.
+# Programs that count as a shell prompt, allowing cwd to replace their label.
 # Assigning the array replaces the default; SHELLS=() disables the category.
 # SHELLS=(zsh bash sh fish dash ksh)
 
-# Programs shown by name only, without command-line args. Coding agents live
-# here so an agent tab reads "claude" instead of its full invocation.
+# Program components shown by name only, without command-line args. Coding
+# agents live here so the label starts with "claude" instead of its invocation.
 # NAME_ONLY_PROGRAMS=(nvim vim vi view gvim git lazygit gitui lazydocker claude codex aider)
 
 # Quick commands that should not take over the tab name: while one runs, the tab
-# keeps showing the shell so it does not flicker.
+# keeps its shell/cwd prompt label so it does not flicker.
 # IGNORED_PROGRAMS=(ls eza ll la cd z zoxide cat bat less more echo pwd clear which man head tail wc cp mv rm mkdir touch fzf sudo doas)
 
 # Rename specific programs on the tab. "<program>=<label>" pairs; wins over every

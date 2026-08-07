@@ -17,7 +17,7 @@
 # Both default on and are configured in config.sh ($HERDR_AUTOMATIC_RENAME_CONFIG). A
 # single unified reconcile drives both: one pass computes a tab's base name and
 # its "[N]" prefix together and issues one rename per item, so a brand-new tab
-# settles at "[3] zsh" in a single rename with no placeholder flicker.
+# settles at "[3] project" in a single rename with no placeholder flicker.
 #
 # Invoked several ways, all routing through ar_run:
 #   * herdr [[events]] hooks:     automatic-rename.sh <event.name>
@@ -27,8 +27,8 @@
 #   * the "clear" action:         automatic-rename.sh --clear    (strip all prefixes)
 #
 # The live per-command hooks ship with the plugin under shell/ (hook.zsh,
-# hook.bash, hook.fish); each passes its own shell name to precmd so a bare
-# prompt in a bash/fish pane reads "bash"/"fish" rather than $SHELL.
+# hook.bash, hook.fish); each passes its own shell name and cwd to precmd so a
+# bare prompt can use the authoritative directory immediately after `cd`.
 #
 # herdr has no per-tab metadata and no auto/manual flag, so the manual-rename
 # exclusion is tracked here: a JSON state file remembers the last base we set
@@ -487,7 +487,8 @@ ar_reconcile_tabs() {
       fi
       # Placeholder skip: with naming ON but no name computed yet, a bare-integer
       # base is herdr's transient placeholder ("3"). Numbering it now would flash
-      # a throwaway "[3] 3" that the next event/zsh hook clobbers to "[3] zsh".
+      # a throwaway "[3] 3" that the next event/shell hook replaces with the
+      # real prompt label.
       # Defer this pass; the position (i) is still counted so later tabs are
       # correct. With naming OFF we DO number it (nothing else ever will), and
       # --clear must strip, so both skip this guard. An EMPTY base is not a
@@ -743,7 +744,8 @@ ar_reconcile() {
   # herdr with no `api snapshot`, a socket hiccup) falls back to the separate list
   # calls, so this never raises the plugin's min herdr version. Per-tab foreground
   # detection (`pane process-info`) is unaffected -- the snapshot carries panes but
-  # not each pane's foreground process, so naming still samples per named tab.
+  # not each pane's foreground process, so naming still samples per named tab;
+  # cwd comes from the cached pane slice itself.
   AR_HAVE_SNAPSHOT=0
   AR_SNAP_TABS_JSON=""
   AR_SNAP_AGENTS_JSON=""
@@ -791,7 +793,7 @@ ar_reconcile() {
 # (AR_FAST_SAMPLE=1, the hook classified the word as a shell construct --
 # function/builtin/reserved/typo): the word is NOT the program, so read the
 # pane's real foreground process instead. An instant construct has exited by
-# sample time (leader = the shell -> name already "zsh" -> no rename, no
+# sample time (leader = the shell -> prompt label already current -> no rename, no
 # flicker); a construct wrapping nvim samples as nvim. On sampling failure
 # rename nothing -- never guess.
 ar_fast_once() {

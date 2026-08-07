@@ -13,21 +13,36 @@ computes the label every item should have and issues one rename per item whose
 label is wrong. Older herdr with no `api snapshot` falls back to reading
 `workspace list`, `pane list`, and `agent list` once each plus `tab list` per
 workspace. Either way, per-tab foreground detection stays one `pane process-info`
-per named tab — the snapshot carries the pane list but not each pane's foreground
-process.
+per named tab — the snapshot carries pane identity and cwd data but not each
+pane's foreground process.
 
 Computing a tab's name and its `[N]` prefix in the same pass is what lets a
-brand-new tab settle at `[3] zsh` in a single rename. Every rename is
+brand-new tab settle at `[3] project` in a single rename. Every rename is
 skip-if-correct, so re-firing the pass (herdr's own rename re-emits
 `tab.renamed`) changes nothing and cannot loop.
 
 ## Naming lives in a pure module
 
-`naming.sh` turns `(program, cmdline)` into a display name and touches neither
+`naming.sh` turns `(program, cmdline, cwd)` into a display name and touches neither
 herdr nor the filesystem. That keeps the naming rules (shells, name-only
-programs, ignored programs, aliases, substitutions, truncation, icons) unit
-testable in isolation. The engine calls `ar_format` across that seam. Every
-function in both files uses the `ar_` prefix.
+programs, ignored programs, aliases, substitutions, cwd basename, truncation,
+icons) unit testable in isolation. The engine calls `ar_format` across that
+seam. Every function in both files uses the `ar_` prefix.
+
+## Cwd comes from the state each path already owns
+
+A full reconcile selects the active pane from cached snapshot or `pane list`
+data and carries `.foreground_cwd // .cwd // ""` through the same resolver as
+the pane id. `pane process-info` remains responsible only for the foreground
+program and command. This keeps the existing request count: no cwd-specific
+socket call is added.
+
+The fast path has a better source. zsh, bash, and fish pass their quoted `$PWD`
+to both preexec and prompt/postexec calls. The prompt callback runs after `cd`,
+so it updates the directory label immediately without a separate chdir hook.
+These values can briefly differ by design: Herdr's `foreground_cwd` follows the
+foreground process when resolvable, while the hook value is the shell's cwd at
+the moment the hook fires.
 
 ## Why config and state sit at fixed paths
 
@@ -152,9 +167,11 @@ integer is numbered as-is, since nothing else will ever name it.
 
 ## An empty name is a name (HIDE_SHELL)
 
-`HIDE_SHELL=1` labels a shell tab with the empty string, because that is the only
-way to get herdr's own tab number back on screen: herdr renders the number
-whenever a tab has no label, and there is no API to ask for it directly.
+`HIDE_SHELL=1` suppresses the shell component. With `SHOW_CWD=1`, a resolved cwd
+still supplies an independent directory label. When cwd display is disabled or
+cwd is unavailable, the result is the empty string, because that is the only way
+to get herdr's own tab number back on screen: herdr renders the number whenever
+a tab has no label, and there is no API to ask for it directly.
 
 The empty string is now a name the engine has to carry around, so the invariant
 is: **a name is returned on stdout, and "cannot compute one" is reported only
@@ -184,7 +201,7 @@ computable *yet*, while an empty name is computed and final.
 
 ## Testing
 
-`tests/` runs on bash and jq alone (no bats). It covers the pure naming rules,
+`tests/` runs on bash and jq alone (no bats). It covers the pure naming and cwd rules,
 the `[N]` prefix helpers, the JSON state store and opt-out state machine, the
 shell hooks, and a full reconcile driven against a fake `herdr` (`tests/mocks/herdr`)
 that serves fixture JSON and records every rename the engine issues. Sourcing

@@ -27,12 +27,10 @@
 : "${SHELL_NAME:=${SHELL##*/}}"
 : "${SHELL_NAME:=zsh}"
 
-# 1 = give the tab no name at all in every case that would otherwise show the
-# shell: a bare prompt, an explicit SHELLS entry, an IGNORED_PROGRAMS command.
-# The empty label hands the tab back to herdr, which then renders its own tab
-# number, so a shell tab reads "3" instead of "zsh" (issue #5). With AUTO_INDEX=1
-# the label keeps the jump number and nothing else ("[3]"), so the tab can still
-# be jumped to.
+# 1 = suppress the shell component at a bare prompt, for an explicit SHELLS
+# entry, or for an IGNORED_PROGRAMS command. A cwd component remains visible.
+# Without one, the empty label hands the tab back to herdr, which renders its own
+# number; with AUTO_INDEX=1 the label keeps only the jump number ("[3]").
 : "${HIDE_SHELL:=0}"
 
 # Foreground processes that mean "a shell prompt" -> shown by their own name.
