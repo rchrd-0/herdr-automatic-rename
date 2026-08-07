@@ -261,11 +261,12 @@ ar_name_eligible() {
 # tab-name computation (herdr-touching; feeds ar_format from naming.sh)
 # ======================================================================
 
-# ar_resolve_pane <tab_id> <pane_count> <focused> -> the active pane_id or "".
+# ar_resolve_pane <tab_id> <pane_count> <focused> -> TSV "pane_id<TAB>cwd".
 # The sole pane of a single-pane tab, else the globally focused pane for the
 # focused tab. A background multi-pane tab exposes no active pane over the socket
-# and returns "" (its name is left as-is until it is next focused). Reads the
-# cached $AR_PANES_JSON.
+# and returns empty fields (its name is left as-is until it is next focused).
+# Reads pane identity and foreground cwd from the cached $AR_PANES_JSON so name
+# computation never needs another herdr request.
 ar_resolve_pane() {
   local tid=$1 pc=$2 foc=$3
   printf '%s' "$AR_PANES_JSON" | jq -r --arg t "$tid" --arg pc "$pc" --arg foc "$foc" '
@@ -274,7 +275,10 @@ ar_resolve_pane() {
     | (if $pc == "1" then $tp[0]
        elif $foc == "true" then (($p | map(select(.focused)) | .[0]) // $tp[0])
        else null end)
-    | if . == null then "" else (.pane_id // "") end
+    | if . == null then ["", ""]
+      else [(.pane_id // ""), (.foreground_cwd // .cwd // "")]
+      end
+    | @tsv
   ' 2>/dev/null
 }
 
@@ -313,8 +317,9 @@ ar_pane_program() {
 # failure); a successful HIDE_SHELL computation returns 0 with EMPTY output, so
 # the caller must read the status, not the string, to tell the two apart.
 ar_tab_name() {
-  local pane info prog="" cmd=""
-  pane=$(ar_resolve_pane "$1" "$2" "$3")
+  local pane_data pane="" cwd="" info prog="" cmd=""
+  pane_data=$(ar_resolve_pane "$1" "$2" "$3")
+  IFS=$'\t' read -r pane cwd <<< "$pane_data"
   [ -n "$pane" ] || return 1
   # process-info can fail transiently (pane closing, socket hiccup) or resolve no
   # foreground process; both leave prog empty. Fail so the caller keeps the tab's
@@ -323,7 +328,7 @@ ar_tab_name() {
   info=$(ar_pane_program "$pane") || return 1
   IFS=$'\t' read -r prog cmd <<< "$info"
   [ -n "$prog" ] || return 1
-  ar_format "$prog" "$cmd"
+  ar_format "$prog" "$cmd" "$cwd"
 }
 
 # ======================================================================

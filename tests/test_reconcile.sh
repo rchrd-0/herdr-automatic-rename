@@ -501,4 +501,86 @@ check_absent "erased name does not blank a tab" "$(log)" "tab rename w1:t1"
 unset MAX_NAME_LEN
 teardown
 
+# ======================================================================
+# Scenario 14: cwd-aware naming reads cwd from the cached pane list.
+#   foreground_cwd wins over cwd when both exist; cwd is the fallback when the
+#   foreground value is absent. No separate cwd query is available in the mock.
+# ======================================================================
+setup
+export NAME_TABS=1 AUTO_INDEX=0 SHOW_CWD=1
+fixture workspaces.json <<'JSON'
+{"result":{"workspaces":[{"workspace_id":"w1","label":"code"}]}}
+JSON
+fixture tabs_w1.json <<'JSON'
+{"result":{"tabs":[
+  {"tab_id":"w1:t1","label":"1","pane_count":1,"focused":true},
+  {"tab_id":"w1:t2","label":"2","pane_count":1,"focused":false}
+]}}
+JSON
+fixture panes.json <<'JSON'
+{"result":{"panes":[
+  {"pane_id":"p1","tab_id":"w1:t1","focused":true,"foreground_cwd":"/Users/test/code/foo","cwd":"/wrong/fallback"},
+  {"pane_id":"p2","tab_id":"w1:t2","focused":false,"cwd":"/Users/test/code/bar"}
+]}}
+JSON
+fixture procinfo_p1.json <<'JSON'
+{"result":{"process_info":{"foreground_process_group_id":100,
+  "foreground_processes":[{"pid":100,"argv0":"-zsh","cmdline":"-zsh"}]}}}
+JSON
+fixture procinfo_p2.json <<'JSON'
+{"result":{"process_info":{"foreground_process_group_id":200,
+  "foreground_processes":[{"pid":200,"argv0":"nvim","cmdline":"nvim README.md"}]}}}
+JSON
+run_event tab.focused
+out=$(log)
+check_contains "pane list: foreground cwd wins" "$out" "tab rename w1:t1 foo"
+check_contains "pane list: cwd fallback is used" "$out" "tab rename w1:t2 nvim:bar"
+check_absent "pane list: lower-priority cwd ignored" "$out" "fallback"
+teardown
+
+# ======================================================================
+# Scenario 15: the snapshot pane slice carries cwd through the same resolver.
+# ======================================================================
+setup
+export NAME_TABS=1 AUTO_INDEX=0 SHOW_CWD=1
+fixture snapshot.json <<'JSON'
+{"result":{"snapshot":{
+  "workspaces":[{"workspace_id":"w1","label":"code"}],
+  "tabs":[{"tab_id":"w1:t1","label":"1","pane_count":1,"focused":true,"workspace_id":"w1"}],
+  "panes":[{"pane_id":"p1","tab_id":"w1:t1","focused":true,"foreground_cwd":"/Users/test/code/project"}],
+  "agents":[]
+}}}
+JSON
+fixture procinfo_p1.json <<'JSON'
+{"result":{"process_info":{"foreground_process_group_id":100,
+  "foreground_processes":[{"pid":100,"argv0":"codex","cmdline":"codex"}]}}}
+JSON
+run_event tab.focused
+check_contains "snapshot: foreground cwd reaches formatter" "$(log)" "tab rename w1:t1 codex:project"
+teardown
+
+# ======================================================================
+# Scenario 16: disabling cwd display keeps the existing name even when the
+#   cached pane has cwd data.
+# ======================================================================
+setup
+export NAME_TABS=1 AUTO_INDEX=0 SHOW_CWD=0
+fixture workspaces.json <<'JSON'
+{"result":{"workspaces":[{"workspace_id":"w1","label":"code"}]}}
+JSON
+fixture tabs_w1.json <<'JSON'
+{"result":{"tabs":[{"tab_id":"w1:t1","label":"1","pane_count":1,"focused":true}]}}
+JSON
+fixture panes.json <<'JSON'
+{"result":{"panes":[{"pane_id":"p1","tab_id":"w1:t1","focused":true,"foreground_cwd":"/Users/test/code/project"}]}}
+JSON
+fixture procinfo_p1.json <<'JSON'
+{"result":{"process_info":{"foreground_process_group_id":100,
+  "foreground_processes":[{"pid":100,"argv0":"nvim","cmdline":"nvim README.md"}]}}}
+JSON
+run_event tab.focused
+check_contains "SHOW_CWD disabled: existing reconcile output" "$(log)" "tab rename w1:t1 nvim"
+check_absent "SHOW_CWD disabled: no cwd suffix" "$(log)" "project"
+teardown
+
 t_summary
