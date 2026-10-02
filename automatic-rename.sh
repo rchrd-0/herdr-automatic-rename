@@ -180,49 +180,96 @@ ar_unlock() {
 # ======================================================================
 # naming state (atomic temp+mv; jq keyed by tab_id; only NAME_TABS uses it)
 # ======================================================================
+# ar_state_read -> one JSON object. Missing or malformed data starts a fresh
+# store; a file read failure or a jq process failure must not erase good state.
+ar_state_read() {
+  local base="" out rc
+  if [ -f "$STATE_FILE" ]; then
+    base=$(cat "$STATE_FILE" 2>/dev/null) || return 1
+  elif [ -e "$STATE_FILE" ]; then
+    return 1
+  fi
+  [ -n "$base" ] || { printf '{}'; return 0; }
+  out=$(printf '%s' "$base" | jq -c -s \
+    'if length == 1 and (.[0] | type) == "object" then .[0] else {} end' 2>/dev/null)
+  rc=$?
+  case "$rc" in
+    0)     printf '%s' "$out" ;;
+    # Parse errors use 4 or 5 across jq releases. Invocation/compile failures
+    # (2/3), or a killed/missing process, are not evidence of corrupt data.
+    4|5)   printf '{}' ;;
+    *)     return 1 ;;
+  esac
+}
+
 ar_state_get() { # <tab_id> <field>
-  [ -f "$STATE_FILE" ] || return 0
+  local base
+  base=$(ar_state_read) || return 1
   # NOT `.[$t][$f] // empty`: `//` treats a boolean `false` as absent, so the
   # `enabled` flag would read back as "" and an opted-out tab would look
   # first-seen on every pass (re-adopting a deliberately numeric name). Emit the
   # value unless it is genuinely null/missing.
-  jq -r --arg t "$1" --arg f "$2" '.[$t][$f] as $v | if $v == null then empty else $v end' \
-    "$STATE_FILE" 2>/dev/null
+  printf '%s' "$base" | jq -r --arg t "$1" --arg f "$2" \
+    '.[$t][$f] as $v | if $v == null then empty else $v end' 2>/dev/null
 }
 ar_state_set() { # <tab_id> <auto-name> <enabled true|false>
-  local base tmp
-  base='{}'
-  [ -f "$STATE_FILE" ] && base=$(cat "$STATE_FILE" 2>/dev/null)
-  [ -n "$base" ] || base='{}'
-  tmp=$(mktemp "$STATE_DIR/.state.XXXXXX") || return 0
-  if printf '%s' "$base" | jq --arg t "$1" --arg a "$2" --argjson e "$3" \
-       '.[$t] = {auto: $a, enabled: $e}' > "$tmp" 2>/dev/null; then
-    mv "$tmp" "$STATE_FILE"
-  else
-    rm -f "$tmp"
+  local base updated tmp
+  base=$(ar_state_read) || return 1
+  updated=$(printf '%s' "$base" | jq -c --arg t "$1" --arg a "$2" --argjson e "$3" \
+    '.[$t] = {auto: $a, enabled: $e}' 2>/dev/null) || return 1
+  [ "$updated" = "$base" ] && return 0
+  tmp=$(mktemp "$STATE_DIR/.state.XXXXXX") || return 1
+  if { printf '%s' "$updated" > "$tmp"; } 2>/dev/null && mv "$tmp" "$STATE_FILE"; then
+    return 0
   fi
+  rm -f "$tmp"
+  return 1
 }
 ar_state_del() { # <tab_id>
-  [ -f "$STATE_FILE" ] || return 0
-  local tmp
-  tmp=$(mktemp "$STATE_DIR/.state.XXXXXX") || return 0
-  if jq --arg t "$1" 'del(.[$t])' "$STATE_FILE" > "$tmp" 2>/dev/null; then
-    mv "$tmp" "$STATE_FILE"
-  else
-    rm -f "$tmp"
+  local base tmp
+  base=$(ar_state_read) || return 1
+  tmp=$(mktemp "$STATE_DIR/.state.XXXXXX") || return 1
+  if { printf '%s' "$base" | jq --arg t "$1" 'del(.[$t])' > "$tmp"; } 2>/dev/null \
+     && mv "$tmp" "$STATE_FILE"; then
+    return 0
   fi
+  rm -f "$tmp"
+  return 1
 }
 ar_state_prune() { # <keep tab_ids...> - drop entries for tabs that no longer exist
-  [ -f "$STATE_FILE" ] || return 0
-  local keep tmp
-  keep=$(printf '%s\n' "$@" | jq -R . | jq -s .) || return 0
-  tmp=$(mktemp "$STATE_DIR/.state.XXXXXX") || return 0
-  if jq --argjson keep "$keep" \
-       'with_entries(select(.key as $k | $keep | index($k)))' "$STATE_FILE" > "$tmp" 2>/dev/null; then
-    mv "$tmp" "$STATE_FILE"
-  else
-    rm -f "$tmp"
+  local keep base pruned tmp
+  # Seeing no ids is not evidence that all tabs have closed.
+  [ "$#" -gt 0 ] || return 0
+  keep=$(printf '%s\n' "$@" | jq -R -s 'split("\n")[:-1]') || return 1
+  base=$(ar_state_read) || return 1
+  pruned=$(printf '%s' "$base" | jq -c --argjson keep "$keep" \
+    'with_entries(select(.key as $k | $keep | index($k)))' 2>/dev/null) || return 1
+  # Avoid rewriting the whole store on every event when no tab has closed.
+  [ "$pruned" != "$base" ] || return 0
+  tmp=$(mktemp "$STATE_DIR/.state.XXXXXX") || return 1
+  if { printf '%s' "$pruned" > "$tmp"; } 2>/dev/null && mv "$tmp" "$STATE_FILE"; then
+    return 0
   fi
+  rm -f "$tmp"
+  return 1
+}
+
+# ar_rename_owned_tab <tab_id> <auto-name> <current-label> <desired-label>
+# Publish ownership before rename emits tab.renamed, so the event handler can
+# recognize our own update. A rejected rename must restore the previous record;
+# otherwise the old label looks like a manual rename on the next pass.
+ar_rename_owned_tab() {
+  local tab=$1 name=$2 label=$3 want=$4 old_auto old_enabled
+  old_auto=$(ar_state_get "$tab" auto) || return 1
+  old_enabled=$(ar_state_get "$tab" enabled) || return 1
+  ar_state_set "$tab" "$name" true || return 1
+  [ "$want" = "$label" ] && return 0
+  if "$HERDR" tab rename "$tab" "$want" >/dev/null 2>&1; then return 0; fi
+  case "$old_enabled" in
+    true|false) ar_state_set "$tab" "$old_auto" "$old_enabled" ;;
+    *)          ar_state_del "$tab" ;;
+  esac
+  return 1
 }
 
 # ar_tab_rename_is_owned <tab_id> -> true when the tab's current base is the
@@ -250,8 +297,8 @@ ar_tab_rename_is_owned() {
 # computed name, so an opted-out tab costs no process-info call.
 ar_name_eligible() {
   local tab=$1 slabel=$2 enabled auto
-  enabled=$(ar_state_get "$tab" enabled)
-  auto=$(ar_state_get "$tab" auto)
+  enabled=$(ar_state_get "$tab" enabled) || return 1
+  auto=$(ar_state_get "$tab" auto) || return 1
   if [ -n "${AR_FORCE_TAB:-}" ] && [ "$tab" = "$AR_FORCE_TAB" ]; then
     return 0                                    # reset forces re-adoption
   elif [ -z "$enabled" ]; then
@@ -510,22 +557,40 @@ ar_sync_tab_number_token() {
 # (naming if owned/eligible, else the stripped current base) and apply the
 # position prefix in a single rename. Arg 1 is the cached `workspace list` JSON.
 ar_reconcile_tabs() {
-  local wsjson=$1 w tjson rows tid label pcount foc base0 base named name i want
-  [ -n "$wsjson" ] || return 0
+  local wsjson=$1 wsrows w tjson rows tid label pcount foc base0 base named name i want
+  # A failed or malformed read is not evidence that the missing tabs closed.
+  # Validate whole lists before consuming any rows, including each id that will
+  # enter the space-separated prune list.
+  wsrows=$(printf '%s' "$wsjson" | jq -r -s '
+    if length == 1 then .[0] else error("expected one workspace response") end
+    | (.result.workspaces // .workspaces)
+    | if type == "array" and all(.[];
+        .workspace_id | type == "string" and length > 0 and (test("[[:space:][:cntrl:]]") | not))
+      then .[].workspace_id else error("incomplete workspace list") end
+  ' 2>/dev/null) || { AR_TABS_PARTIAL=1; return 0; }
   while IFS= read -r w; do
     [ -n "$w" ] || continue
     if [ "${AR_HAVE_SNAPSHOT:-0}" = "1" ]; then
       # Slice this workspace's tabs out of the cached snapshot, preserving array
       # order (what cmd+N numbers by). Same shape as `tab list --workspace`.
       tjson=$(printf '%s' "$AR_SNAP_TABS_JSON" | jq -c --arg w "$w" \
-        '{result:{tabs:[(.result.tabs // [])[]|select(.workspace_id==$w)]}}' 2>/dev/null)
+        '.result.tabs
+         | if type == "array" and all(.[];
+             .workspace_id | type == "string" and length > 0 and (test("[[:space:][:cntrl:]]") | not))
+           then {result:{tabs:[.[]|select(.workspace_id==$w)]}}
+           else error("incomplete snapshot tab list") end' 2>/dev/null) \
+        || { AR_TABS_PARTIAL=1; continue; }
     else
-      tjson=$("$HERDR" tab list --workspace "$w" 2>/dev/null) || continue
+      tjson=$("$HERDR" tab list --workspace "$w" 2>/dev/null) || { AR_TABS_PARTIAL=1; continue; }
     fi
-    [ -n "$tjson" ] || continue
-    rows=$(printf '%s' "$tjson" | jq -r '
-      (.result.tabs // .tabs // [])[]
-      | [ .tab_id, (.label // ""), (.pane_count // 0), (.focused // false) ] | @tsv' 2>/dev/null)
+    rows=$(printf '%s' "$tjson" | jq -r -s '
+      if length == 1 then .[0] else error("expected one tab response") end
+      | (.result.tabs // .tabs)
+      | if type == "array" and all(.[];
+          .tab_id | type == "string" and length > 0 and (test("[[:space:][:cntrl:]]") | not))
+        then .[] else error("incomplete tab list") end
+      | [ .tab_id, (.label // ""), (.pane_count // 0), (.focused // false) ] | @tsv' 2>/dev/null) \
+      || { AR_TABS_PARTIAL=1; continue; }
     [ -n "$rows" ] || continue
     i=0
     while IFS=$'\t' read -r tid label pcount foc; do
@@ -548,7 +613,6 @@ ar_reconcile_tabs() {
            && { [ -n "$name" ] || [ "${HIDE_SHELL:-0}" = "1" ]; }; then
           base=$name
           named=1
-          ar_state_set "$tid" "$name" true     # record ownership even if no rename
         fi
       fi
       # herdr has not labeled this tab yet and we computed no name, so there is no
@@ -575,10 +639,13 @@ ar_reconcile_tabs() {
         continue
       fi
       want=$(ar_desired "$i" "$base")
-      [ "$want" = "$label" ] && continue
-      "$HERDR" tab rename "$tid" "$want" >/dev/null 2>&1 || true
+      if [ "$named" = "1" ]; then
+        ar_rename_owned_tab "$tid" "$name" "$label" "$want" || continue
+      elif [ "$want" != "$label" ]; then
+        "$HERDR" tab rename "$tid" "$want" >/dev/null 2>&1 || continue
+      fi
     done <<< "$rows"
-  done <<< "$(printf '%s' "$wsjson" | jq -r '(.result.workspaces // .workspaces // [])[].workspace_id' 2>/dev/null)"
+  done <<< "$wsrows"
 }
 
 # ar_agent_revert <pane_id> <base> <detected>
@@ -814,7 +881,7 @@ ar_reconcile() {
   local wsjson snap need_panes=0
   # A reset deletes the target tab's state once (under the lock) so it re-adopts.
   if [ -n "${AR_FORCE_TAB:-}" ] && [ -z "${AR_FORCE_DONE:-}" ]; then
-    ar_state_del "$AR_FORCE_TAB"
+    ar_state_del "$AR_FORCE_TAB" || return 0
     AR_FORCE_DONE=1
   fi
   # One `herdr api snapshot` (herdr >= 0.7.2) carries the workspace, tab, pane,
@@ -842,7 +909,8 @@ ar_reconcile() {
   fi
   snap=$("$HERDR" api snapshot 2>/dev/null) || snap=""
   if [ -n "$snap" ] && printf '%s' "$snap" \
-       | jq -e '(.result.snapshot // .snapshot).workspaces' >/dev/null 2>&1; then
+       | jq -e -s 'length == 1 and (.[0] | (.result.snapshot // .snapshot)
+           | (.workspaces | type == "array") and (.tabs | type == "array"))' >/dev/null 2>&1; then
     AR_HAVE_SNAPSHOT=1
     wsjson=$(printf '%s' "$snap" | jq -c \
       '{result:{workspaces:((.result.snapshot // .snapshot).workspaces // [])}}' 2>/dev/null)
@@ -871,8 +939,12 @@ ar_reconcile() {
   fi
   if [ "$CLEAR" = "1" ] || [ "$AUTO_INDEX" = "1" ] || [ "$NAME_TABS" = "1" ]; then
     AR_SEEN_TABS=""
+    AR_TABS_PARTIAL=""
     ar_reconcile_tabs "$wsjson"
-    [ "$NAME_TABS" = "1" ] && [ -n "$AR_SEEN_TABS" ] && ar_state_prune $AR_SEEN_TABS
+    # Only a complete read can confirm a tab has closed. A later successful
+    # pass will prune records retained after a transient query failure.
+    [ "$NAME_TABS" = "1" ] && [ -n "$AR_SEEN_TABS" ] && [ -z "$AR_TABS_PARTIAL" ] \
+      && ar_state_prune $AR_SEEN_TABS
   fi
   if [ "$CLEAR" = "1" ] || [ "$AUTO_INDEX" = "1" ]; then
     ar_renumber_agents
@@ -895,7 +967,7 @@ ar_reconcile() {
 ar_fast_once() {
   local tab="${HERDR_TAB_ID:-}"
   [ -n "$tab" ] || return 0
-  local prog="" cmd="" cwd="${AR_FAST_CWD:-}" info name label raw prefix slabel enabled auto want old_auto old_enabled
+  local prog="" cmd="" cwd="${AR_FAST_CWD:-}" info name label raw prefix slabel want
   if [ "$MODE" = "preexec" ]; then
     if [ "${AR_FAST_SAMPLE:-}" = "1" ]; then
       info=$(ar_pane_program "${HERDR_PANE_ID:-}") || return 0
@@ -929,24 +1001,7 @@ ar_fast_once() {
     prefix="${prefix% }"                        # "[3] " -> "[3]", "" stays ""
   fi
   want="${prefix}${name}"
-  if [ "$want" != "$label" ]; then
-    # Record ownership before asking herdr to rename. tab rename emits
-    # tab.renamed before this command necessarily returns; the event handler can
-    # now recognize our label and avoid a stale-cwd reconcile. Roll state back if
-    # the rename itself fails.
-    old_auto=$(ar_state_get "$tab" auto)
-    old_enabled=$(ar_state_get "$tab" enabled)
-    ar_state_set "$tab" "$name" true
-    if ! "$HERDR" tab rename "$tab" "$want" >/dev/null 2>&1; then
-      case "$old_enabled" in
-        true|false) ar_state_set "$tab" "$old_auto" "$old_enabled" ;;
-        *)          ar_state_del "$tab" ;;
-      esac
-      return 0
-    fi
-  else
-    ar_state_set "$tab" "$name" true
-  fi
+  ar_rename_owned_tab "$tab" "$name" "$label" "$want" || return 0
 }
 
 # Coalesce bursts: only the lock holder works; contenders raise the rerun flag

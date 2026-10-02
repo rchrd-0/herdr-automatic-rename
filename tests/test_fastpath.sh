@@ -258,4 +258,24 @@ JSON
 check "cd race: delayed sampled shell keeps newer prompt cwd" "" "$(log)"
 teardown
 
+# State publication must land before a fast rename is attempted.
+setup
+printf 'mktemp() { return 1; }\n' > "$HERDR_AUTOMATIC_RENAME_CONFIG"
+/usr/bin/env bash "$ENGINE" preexec "nvim README.md"
+check "failed fast state write prevents rename" "" "$(log)"
+check "failed fast state write keeps prior claim" "zsh" \
+  "$(jq -r '.t1.auto' "$XDG_STATE_HOME/herdr-automatic-rename/state.json")"
+teardown
+
+setup
+: > "$HERDR_MOCK_DIR/tab_rename.fail"
+/usr/bin/env bash "$ENGINE" preexec "nvim README.md"
+check "rejected fast rename restores prior claim" "zsh" \
+  "$(jq -r '.t1.auto' "$XDG_STATE_HOME/herdr-automatic-rename/state.json")"
+rm -f "$HERDR_MOCK_DIR/tab_rename.fail"
+: > "$HERDR_MOCK_LOG"
+/usr/bin/env bash "$ENGINE" preexec "nvim README.md"
+check "rejected fast rename can retry" "tab rename t1 [1] nvim" "$(log)"
+teardown
+
 t_summary

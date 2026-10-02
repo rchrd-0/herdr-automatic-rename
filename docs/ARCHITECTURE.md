@@ -64,6 +64,22 @@ herdr exposes no per-tab metadata and no auto/manual flag, so the manual-rename
 opt-out is tracked in a small JSON state file keyed by `tab_id`: the last base
 the plugin set, and whether auto-naming is still enabled for that tab.
 
+State reads require one JSON object. Missing, blank, malformed, or differently
+shaped JSON is treated as an empty store so the next write or reset can recover
+it. A failed file read or a jq process that cannot run is different: writers
+return failure and leave the existing file alone.
+
+Both naming paths publish ownership before calling `tab rename`, allowing a
+synchronous `tab.renamed` event to recognize the plugin's own update. If the
+state write fails, no rename is attempted; if Herdr rejects the rename, the
+previous ownership record is restored so the next event can retry.
+
+A reconcile prunes closed tabs only after reading every workspace's tab list
+successfully. Failed, empty, malformed, or incomplete responses defer pruning
+until a later complete pass. A valid empty tab array still counts as a complete
+read. Empty keep lists and prune passes that remove nothing leave the state
+file untouched.
+
 ## Locking
 
 A `mkdir` lock (atomic, ownership-token stamped, 30-second steal window) plus a

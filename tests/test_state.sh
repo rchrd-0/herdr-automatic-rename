@@ -31,6 +31,67 @@ check "pruned entry gone"      "" "$(ar_state_get b auto)"
 check "kept entry a"           "x" "$(ar_state_get a auto)"
 check "kept entry c"           "z" "$(ar_state_get c auto)"
 
+# Invalid stores heal to one object on the next write.
+for invalid in '' 'broken' 'null' '[]' '42' '{} {}'; do
+  printf '%s' "$invalid" > "$STATE_FILE"
+  ar_state_set repaired nvim true
+  check "invalid store heals ($invalid)" "nvim" "$(ar_state_get repaired auto)"
+  check "invalid store becomes one object ($invalid)" "true" \
+    "$(jq -s 'length == 1 and (.[0] | type == "object")' "$STATE_FILE")"
+done
+printf '\n' > "$STATE_FILE"
+ar_state_set repaired zsh true
+check "newline-only store heals" "zsh" "$(ar_state_get repaired auto)"
+
+# A complete keep list and an absent one must leave the existing inode alone.
+# A hard link witnesses replacement by temp+mv without relying on timestamp resolution.
+rm -f "$STATE_FILE"
+ar_state_set a x true
+ar_state_set c z true
+ln "$STATE_FILE" "$SB/original-state"
+ar_state_prune a c
+check "unchanged prune preserves file" "yes" \
+  "$([ "$STATE_FILE" -ef "$SB/original-state" ] && printf yes || printf no)"
+ar_state_prune
+check "empty prune preserves records" "x" "$(ar_state_get a auto)"
+check "empty prune preserves file" "yes" \
+  "$([ "$STATE_FILE" -ef "$SB/original-state" ] && printf yes || printf no)"
+
+# Inject read/process failures without relying on filesystem privileges.
+printf '{"a":{"auto":"x","enabled":true},"c":{"auto":"z","enabled":true}}\n' > "$STATE_FILE"
+before=$(cat "$STATE_FILE")
+cat() { [ "$1" = "$STATE_FILE" ] && return 1; command cat "$@"; }
+ar_state_set b y true
+check_rc "unreadable store refuses write" 1 $?
+ar_state_del a
+ar_state_prune c
+unset -f cat
+check "unreadable store survives all writers" "$before" "$(cat "$STATE_FILE")"
+jq() { return 137; }
+ar_state_set b y true
+check_rc "crashed jq refuses write" 1 $?
+ar_state_del a
+ar_state_prune c
+unset -f jq
+check "crashed jq preserves valid store" "$before" "$(cat "$STATE_FILE")"
+
+# Fail only the initial validation: a later successful jq must not write over
+# valid state using an empty base produced by an invocation or compile failure.
+for jq_status in 2 3; do
+  rm -f "$SB/jq-failed"
+  jq() {
+    if [ ! -e "$SB/jq-failed" ]; then
+      : > "$SB/jq-failed"
+      return "$jq_status"
+    fi
+    command jq "$@"
+  }
+  ar_state_set b y true
+  check_rc "jq status $jq_status refuses write" 1 $?
+  unset -f jq
+  check "jq status $jq_status preserves valid store" "$before" "$(cat "$STATE_FILE")"
+done
+
 # ======================================================================
 # ar_name_eligible state machine. rc 0 = eligible for auto-naming, 1 = leave it.
 # ======================================================================

@@ -8,6 +8,20 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib.sh"
 REPO=$(cd "$here/.." && pwd)
 
+# Self-location tests source the real hooks and can launch the real engine.
+# Keep even those calls off a live session, including when these tests run in
+# a Herdr pane with inherited tab ids or plugin paths.
+HOOKS_SB=$(mktemp -d "${TMPDIR:-/tmp}/hal-hooks.XXXXXX")
+export HERDR_BIN_PATH="$here/mocks/herdr"
+export HERDR_PLUGIN_ROOT="$REPO"
+export HERDR_MOCK_DIR="$HOOKS_SB/fixtures"; mkdir -p "$HERDR_MOCK_DIR"
+export HERDR_MOCK_LOG="$HOOKS_SB/renames.log"; : >"$HERDR_MOCK_LOG"
+export XDG_STATE_HOME="$HOOKS_SB/state"
+export HERDR_AUTOMATIC_RENAME_CONFIG="$HOOKS_SB/none.sh"
+export HERDR_CONFIG_FILE="$HOOKS_SB/herdr.toml"
+export HERDR_SOCKET_PATH="$HOOKS_SB/herdr.sock"
+export HERDR_TAB_ID="sandbox:t0"
+
 # ---- bash ----
 got=$(HERDR_PANE_ID=x HAL_HOOK="$REPO/shell/hook.bash" /usr/bin/env bash -c 'source "$HAL_HOOK"; echo "$_har_bin"')
 check "bash: self-locates engine next to hook" "$REPO/automatic-rename.sh" "$got"
@@ -117,4 +131,6 @@ else
   echo "# skip: fish not installed"
 fi
 
+# Hook workers are detached; leaving their disposable directory available
+# avoids racing a late worker's mock/state writes during cleanup.
 t_summary

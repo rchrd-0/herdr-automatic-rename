@@ -17,6 +17,8 @@
 # Mutating commands (the whole point of the test) are appended verbatim to
 # $HERDR_MOCK_LOG so the test can assert exactly which renames and metadata
 # reports the engine issued.
+# Fault marker fixtures workspaces.fail / tabs_<id>.fail reject list reads;
+# tab_rename.fail rejects a logged rename attempt.
 # A missing query fixture yields a valid-but-empty result so the engine degrades
 # the same way it would against a real herdr that returned nothing.
 
@@ -40,7 +42,8 @@ case "$group" in
     exit 0 ;;
   workspace)
     case "$action" in
-      list)   serve workspaces.json '{"result":{"workspaces":[]}}' ;;
+      list)   [ -e "$dir/workspaces.fail" ] && exit 1
+              serve workspaces.json '{"result":{"workspaces":[]}}' ;;
       rename) printf 'workspace rename %s %s\n' "$1" "$2" >>"$log" ;;
     esac ;;
   tab)
@@ -48,9 +51,11 @@ case "$group" in
       list)
         w=""
         while [ $# -gt 0 ]; do case "$1" in --workspace) w="$2"; shift 2 ;; *) shift ;; esac; done
+        [ -e "$dir/tabs_$w.fail" ] && exit 1
         serve "tabs_$w.json" '{"result":{"tabs":[]}}' ;;
       get)    serve "tab_$1.json" '{}' ;;
-      rename) printf 'tab rename %s %s\n' "$1" "$2" >>"$log" ;;
+      rename) printf 'tab rename %s %s\n' "$1" "$2" >>"$log"
+              [ -e "$dir/tab_rename.fail" ] && exit 1 ;;
     esac ;;
   pane)
     case "$action" in

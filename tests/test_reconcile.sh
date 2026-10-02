@@ -657,4 +657,99 @@ check_absent "tab token: unrelated metadata is untouched" "$out" \
   "pane report-metadata p2"
 teardown
 
+# Partial list reads cannot decide that unobserved tabs have closed.
+# Once the missing list is complete again, a truly closed tab is pruned.
+for fault in failed empty malformed missing-field missing-id; do
+  setup
+  export NAME_TABS=1 AUTO_INDEX=0
+  mkdir -p "$XDG_STATE_HOME/herdr-automatic-rename"
+  state="$XDG_STATE_HOME/herdr-automatic-rename/state.json"
+  printf '{"w1:t1":{"auto":"zsh","enabled":true},"w2:t1":{"auto":"nvim","enabled":true},"closed":{"auto":"old","enabled":true}}' > "$state"
+  fixture workspaces.json <<'JSON'
+{"workspaces":[{"workspace_id":"w1"},{"workspace_id":"w2"}]}
+JSON
+  fixture tabs_w1.json <<'JSON'
+{"tabs":[{"tab_id":"w1:t1","label":"zsh","pane_count":0}]}
+JSON
+  case "$fault" in
+    failed) : > "$HERDR_MOCK_DIR/tabs_w2.fail" ;;
+    empty) : > "$HERDR_MOCK_DIR/tabs_w2.json" ;;
+    malformed) printf '{broken' > "$HERDR_MOCK_DIR/tabs_w2.json" ;;
+    missing-field) printf '{}' > "$HERDR_MOCK_DIR/tabs_w2.json" ;;
+    missing-id) printf '{"tabs":[{"label":"nvim","pane_count":0}]}' > "$HERDR_MOCK_DIR/tabs_w2.json" ;;
+  esac
+  run_event tab.focused
+  check "partial tabs ($fault) preserve unseen ownership" "nvim" "$(jq -r '."w2:t1".auto' "$state")"
+  check "partial tabs ($fault) defer all pruning" "old" "$(jq -r '.closed.auto' "$state")"
+  rm -f "$HERDR_MOCK_DIR/tabs_w2.fail"
+  fixture tabs_w2.json <<'JSON'
+{"tabs":[{"tab_id":"w2:t1","label":"nvim","pane_count":0}]}
+JSON
+  run_event tab.focused
+  check "complete tabs after $fault still own survivor" "true" "$(jq -r '."w2:t1".enabled' "$state")"
+  check "complete tabs after $fault prune closed tab" "false" "$(jq 'has("closed")' "$state")"
+  teardown
+done
+
+for fault in failed empty malformed missing-field missing-id; do
+  setup
+  export NAME_TABS=1 AUTO_INDEX=0
+  mkdir -p "$XDG_STATE_HOME/herdr-automatic-rename"
+  state="$XDG_STATE_HOME/herdr-automatic-rename/state.json"
+  printf '{"w1:t1":{"auto":"zsh","enabled":true},"unseen":{"auto":"nvim","enabled":true}}' > "$state"
+  fixture tabs_w1.json <<'JSON'
+{"tabs":[{"tab_id":"w1:t1","label":"zsh","pane_count":0}]}
+JSON
+  case "$fault" in
+    failed) : > "$HERDR_MOCK_DIR/workspaces.fail" ;;
+    empty) : > "$HERDR_MOCK_DIR/workspaces.json" ;;
+    malformed) printf '{broken' > "$HERDR_MOCK_DIR/workspaces.json" ;;
+    missing-field) printf '{}' > "$HERDR_MOCK_DIR/workspaces.json" ;;
+    missing-id) printf '{"workspaces":[{"workspace_id":"w1"},{}]}' > "$HERDR_MOCK_DIR/workspaces.json" ;;
+  esac
+  run_event tab.focused
+  check "partial workspaces ($fault) preserve ownership" "nvim" "$(jq -r '.unseen.auto' "$state")"
+  teardown
+done
+
+# A rejected rename restores the old claim so the next event can retry it.
+setup
+export NAME_TABS=1 AUTO_INDEX=0
+mkdir -p "$XDG_STATE_HOME/herdr-automatic-rename"
+state="$XDG_STATE_HOME/herdr-automatic-rename/state.json"
+printf '{"t1":{"auto":"zsh","enabled":true}}' > "$state"
+fixture workspaces.json <<'JSON'
+{"workspaces":[{"workspace_id":"w1"}]}
+JSON
+fixture tabs_w1.json <<'JSON'
+{"tabs":[{"tab_id":"t1","label":"zsh","pane_count":1,"focused":true}]}
+JSON
+fixture panes.json <<'JSON'
+{"panes":[{"pane_id":"p1","tab_id":"t1","focused":true}]}
+JSON
+fixture procinfo_p1.json <<'JSON'
+{"process_info":{"foreground_process_group_id":200,"foreground_processes":[{"pid":200,"argv0":"nvim","cmdline":"nvim README.md"}]}}
+JSON
+: > "$HERDR_MOCK_DIR/tab_rename.fail"
+run_event tab.focused
+check "rejected full rename restores prior claim" "zsh" "$(jq -r '.t1.auto' "$state")"
+rm -f "$HERDR_MOCK_DIR/tab_rename.fail"
+: > "$HERDR_MOCK_LOG"
+run_event tab.focused
+check "rejected full rename can retry" "tab rename t1 nvim" "$(log)"
+check "successful retry owns new label" "nvim" "$(jq -r '.t1.auto' "$state")"
+# Fail temporary state creation on the following change.
+fixture procinfo_p1.json <<'JSON'
+{"process_info":{"foreground_process_group_id":300,"foreground_processes":[{"pid":300,"argv0":"vim","cmdline":"vim"}]}}
+JSON
+fixture tabs_w1.json <<'JSON'
+{"tabs":[{"tab_id":"t1","label":"nvim","pane_count":1,"focused":true}]}
+JSON
+printf 'mktemp() { return 1; }\n' > "$HERDR_AUTOMATIC_RENAME_CONFIG"
+: > "$HERDR_MOCK_LOG"
+run_event tab.focused
+check "failed full state write prevents rename" "" "$(log)"
+check "failed full state write preserves ownership" "nvim" "$(jq -r '.t1.auto' "$state")"
+teardown
+
 t_summary
