@@ -1826,6 +1826,7 @@ ar_state_prune_ws() {
 ar_renumber_workspaces() {
   local json=$1 rows wid label pos base lprefix dedupe want ibase track seen=""
   AR_WS_BASES=""
+  AR_SIDEBAR_LABELS=""
   [ -n "$json" ] || return 0
   # Read with its status: a jq that fails after emitting some rows would leave
   # the missing workspaces out of the keep list, and ar_state_prune_ws would drop
@@ -1897,6 +1898,10 @@ ar_renumber_workspaces() {
     if [ "$want" != "$label" ]; then
       "$HERDR" workspace rename "$wid" "$want" >/dev/null 2>&1 || continue
     fi
+    # Sidebar metadata reads the label that actually landed, rather than the
+    # snapshot captured before this pass renamed the workspace.
+    AR_SIDEBAR_LABELS="$AR_SIDEBAR_LABELS$wid$AR_ROW_SEP$want
+"
     # What this workspace is called AFTER this pass, for the tab pass to dedupe
     # against (ar_ws_base). It reads the workspace list this pass fetched, which
     # was fetched before the rename above, so a workspace re-labelled from its
@@ -2479,6 +2484,7 @@ label: $label"
 # everything (the uninstall path).
 ar_reconcile() {
   local wsjson snap
+  AR_SIDEBAR_LABELS=""
   AR_PANES_JSON='{"result":{"panes":[]}}'
   AR_TAB_METADATA_OK=0
   ar_tab_metadata_ok && AR_TAB_METADATA_OK=1
@@ -2588,6 +2594,9 @@ ar_reconcile() {
   if ar_ws_pass; then
     ar_renumber_workspaces "$wsjson"
   fi
+  if [ "$AR_TAB_METADATA_OK" = "1" ]; then
+    ar_sidebar_sync "$wsjson"
+  fi
   if ar_index_pass tabs || [ "$NAME_TABS" = "1" ]; then
     AR_SEEN_TABS=""
     AR_TABS_PARTIAL=""
@@ -2636,6 +2645,9 @@ ar_fast_once() {
   AR_FAST_WS=""
   [ "$MODE" = "precmd" ] && ar_fast_workspace
   [ "$NAME_TABS" = "1" ] && ar_fast_tab
+  if [ "$MODE" = "precmd" ] && [ "${SIDEBAR_CONTEXT:-0}" = "1" ]; then
+    ar_sidebar_refresh_current
+  fi
   return 0
 }
 
@@ -2904,6 +2916,8 @@ ar_main() {
   . "$AR_ROOT/transcript.sh"
   # shellcheck source=fork-metadata.sh
   . "$AR_ROOT/fork-metadata.sh"
+  # shellcheck source=fork-sidebar.sh
+  . "$AR_ROOT/fork-sidebar.sh"
 
   # TITLE_BRANDS as one argument for the two title lifts, joined here so neither
   # pays for it per pane. Both look a brand up by the pane's agent kind, and the
@@ -2944,7 +2958,7 @@ ar_main() {
     precmd)
       # The workspace half runs whether or not tabs are named: which knobs govern
       # a workspace label are the workspace's own (see ar_fast_workspace).
-      { [ "$NAME_TABS" = "1" ] || ar_ws_pass; } || exit 0
+      { [ "$NAME_TABS" = "1" ] || ar_ws_pass || [ "${SIDEBAR_CONTEXT:-0}" = "1" ]; } || exit 0
       # Optional 2nd arg = the calling shell's own name, so a bare prompt in a
       # bash/fish pane reads "bash"/"fish" instead of $SHELL (the login shell).
       # Absent (a bare `precmd` from an older caller) -> keep the SHELL_NAME

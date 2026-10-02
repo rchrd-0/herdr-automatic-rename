@@ -63,6 +63,14 @@
 # next herdr event. With workspace numbering off there is no next pass, so run
 # the `clear` action instead.
 
+# Fork sidebar display: publish checkout identities for spaces and agents.
+# Main checkout: "[5] juliocrm" with branch context "dev".
+# Linked worktree: "[6] feature/login" with repository context "juliocrm".
+# Manual workspace names are preserved. Requires matching custom-token rows in
+# Herdr's config.toml; see docs/FORK.md for the templates and disable procedure.
+# Does not change tab formatting or workspace names. Default off.
+# SIDEBAR_CONTEXT=0
+
 # ---- naming (only used when NAME_TABS=1) ----
 
 # 1 puts the context in front of the program: the pane's directory, its Git
