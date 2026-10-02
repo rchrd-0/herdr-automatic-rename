@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# Nothing here writes to the repo, so the token gets read access and no more.
+permissions:
+  contents: read
+
 jobs:
   test:
     strategy:
@@ -15,7 +19,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # zsh and fish make the hook classification tests run instead of skipping
       # (macOS already ships zsh).
@@ -35,9 +39,14 @@ jobs:
           fish --version
           jq --version
 
+      # Every bash file in the repo, not just the three this used to name.
+      # icons.sh is 168 lines of case arms full of octal escapes, and the test
+      # scripts are most of the codebase. tests/mocks/herdr is bash with no .sh
+      # suffix, so a glob misses it.
       - name: Syntax check
         run: |
-          for f in automatic-rename.sh naming.sh shell/hook.bash; do
+          for f in automatic-rename.sh naming.sh icons.sh git.sh transcript.sh fork-metadata.sh config.example.sh install.sh shell/hook.bash \
+                   tests/run.sh tests/lib.sh tests/test_*.sh tests/mocks/herdr; do
             /bin/bash -n "$f"
           done
           zsh -n shell/hook.zsh
@@ -45,3 +54,54 @@ jobs:
 
       - name: Run tests
         run: ./tests/run.sh
+
+  markdown:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+
+      # Prose here is never hard-wrapped, which the custom no-hard-wrap rule in
+      # .github/markdownlint-rules enforces. Release notes are copied out of
+      # CHANGELOG.md, so a wrap in the source ships as a wrap on GitHub.
+      - name: Lint markdown
+        run: npx --yes markdownlint-cli2@0.23.2
+
+  # The bash sources only. hook.zsh and hook.fish are not bash, and the test job
+  # checks those two with `zsh -n` and `fish -n`. Its own job rather than a step
+  # in the test matrix: the answer is the same on both runners, and apt-get has
+  # no shellcheck on macOS. Keep this file list identical to the Makefile's, so
+  # `make lint` and CI cannot disagree about what is linted.
+  #
+  # -x follows the sourced files, which the `# shellcheck source=` directives
+  # inside them name.
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # A pinned release, not apt-get's. ubuntu-noble packages 0.9.0 while a
+      # contributor's brew is on 0.11.0, and the two disagree about real
+      # findings (SC2218 among them), so an unpinned job fails on what no local
+      # run could reproduce. The version lives in the Makefile, which the
+      # pre-commit hook reads too. The pin fixes the version, the digest beside
+      # it fixes the bytes: a tarball that does not match never reaches PATH.
+      - name: Install shellcheck
+        run: |
+          v="$(make -s print-shellcheck-version)"
+          sum="$(make -s print-shellcheck-sha256)"
+          curl -fsSL -o shellcheck.tar.xz \
+            "https://github.com/koalaman/shellcheck/releases/download/v$v/shellcheck-v$v.linux.x86_64.tar.xz"
+          echo "$sum  shellcheck.tar.xz" | sha256sum -c -
+          sudo tar -xJ --strip-components=1 -C /usr/local/bin -f shellcheck.tar.xz "shellcheck-v$v/shellcheck"
+
+      - name: Version
+        run: shellcheck --version
+
+      - name: Lint shell sources
+        run: |
+          shellcheck -x -s bash automatic-rename.sh naming.sh icons.sh git.sh transcript.sh fork-metadata.sh config.example.sh install.sh \
+            shell/hook.bash tests/*.sh tests/mocks/herdr

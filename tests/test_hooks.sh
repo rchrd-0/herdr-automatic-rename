@@ -5,27 +5,37 @@
 # to itself rather than at any hard-coded path.
 
 here=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=tests/lib.sh
 . "$here/lib.sh"
 REPO=$(cd "$here/.." && pwd)
 
-# Self-location tests source the real hooks and can launch the real engine.
-# Keep even those calls off a live session, including when these tests run in
-# a Herdr pane with inherited tab ids or plugin paths.
+# These tests source the REAL hooks, and a hook resolves the REAL engine next to
+# itself -- that resolution is half of what is under test. So every hook function
+# they call would otherwise reach a live herdr: run this file inside a herdr pane
+# and the engine renames the pane's own tab, then reconciles the whole session,
+# because HERDR_TAB_ID and HERDR_PANE_ID are inherited from that pane and nothing
+# pointed the engine anywhere else. Sandbox the whole file: the fake herdr instead
+# of the real one, its fixtures and log in a temp directory, state alongside them,
+# and tab and pane ids that exist nowhere.
 HOOKS_SB=$(mktemp -d "${TMPDIR:-/tmp}/hal-hooks.XXXXXX")
 export HERDR_BIN_PATH="$here/mocks/herdr"
-export HERDR_PLUGIN_ROOT="$REPO"
 export HERDR_MOCK_DIR="$HOOKS_SB/fixtures"; mkdir -p "$HERDR_MOCK_DIR"
 export HERDR_MOCK_LOG="$HOOKS_SB/renames.log"; : >"$HERDR_MOCK_LOG"
 export XDG_STATE_HOME="$HOOKS_SB/state"
 export HERDR_AUTOMATIC_RENAME_CONFIG="$HOOKS_SB/none.sh"
-export HERDR_CONFIG_FILE="$HOOKS_SB/herdr.toml"
 export HERDR_SOCKET_PATH="$HOOKS_SB/herdr.sock"
 export HERDR_TAB_ID="sandbox:t0"
 
 # ---- bash ----
+# The quoted program runs in the SPAWNED shell, so its $variables are that
+# shell's to expand, not this one's.
+# shellcheck disable=SC2016
 got=$(HERDR_PANE_ID=x HAL_HOOK="$REPO/shell/hook.bash" /usr/bin/env bash -c 'source "$HAL_HOOK"; echo "$_har_bin"')
 check "bash: self-locates engine next to hook" "$REPO/automatic-rename.sh" "$got"
 
+# The quoted program runs in the SPAWNED shell, so its $variables are that
+# shell's to expand, not this one's.
+# shellcheck disable=SC2016
 got=$(HERDR_PANE_ID=x HAL_HOOK="$REPO/shell/hook.bash" /usr/bin/env bash -c \
   'source "$HAL_HOOK"; source "$HAL_HOOK"; printf "%s\n" "$PROMPT_COMMAND" | grep -c _har_precmd_wrap')
 check "bash: double-source adds PROMPT_COMMAND once" "1" "$got"
@@ -43,10 +53,16 @@ got=$(printf 'true\nexit\n' | HERDR_PANE_ID=x /usr/bin/env bash --rcfile "$_rc" 
 rm -f "$_rc"
 check_contains "bash: never clobbers a pre-existing DEBUG trap" "$got" "KEEP_FIRED"
 
+# The quoted program runs in the SPAWNED shell, so its $variables are that
+# shell's to expand, not this one's.
+# shellcheck disable=SC2016
 got=$(HERDR_PANE_ID=x HAL_HOOK="$REPO/shell/hook.bash" /usr/bin/env bash -c \
   'preexec_functions=(); source "$HAL_HOOK"; printf "%s " "${preexec_functions[@]}"')
 check_contains "bash: cooperates with a preexec framework" "$got" "_har_preexec"
 
+# The quoted program runs in the SPAWNED shell, so its $variables are that
+# shell's to expand, not this one's.
+# shellcheck disable=SC2016
 got=$(HAL_HOOK="$REPO/shell/hook.bash" /usr/bin/env bash -c 'unset HERDR_PANE_ID; source "$HAL_HOOK"; echo "${_har_installed:-unset}"')
 check "bash: no-ops outside a herdr pane" "unset" "$got"
 
@@ -54,43 +70,45 @@ check "bash: no-ops outside a herdr pane" "unset" "$got"
 # Copy a hook into a sandbox repo layout whose engine is a stub that logs its
 # argv, then call _har_preexec the way the shell would. A function word must
 # carry the "shell" marker; an external command must not. The engine runs in a
-# backgrounded subshell, so poll briefly for both log lines.
+# detached subshell, so the invoking shell's wait cannot join it. Poll for both
+# log lines, allowing a loaded parallel suite time to schedule the workers.
 clsbox() { # <hook file> -> sets $CLS_SB, $CLS_LOG
   CLS_SB=$(mktemp -d "${TMPDIR:-/tmp}/hal-cls.XXXXXX")
   CLS_LOG="$CLS_SB/args.log"; : >"$CLS_LOG"
-  CLS_CWD="$CLS_SB/cwd with space"; mkdir -p "$CLS_CWD"
-  CLS_CWD=$(cd "$CLS_CWD" && pwd)
   mkdir -p "$CLS_SB/shell"
   cp "$REPO/shell/$1" "$CLS_SB/shell/"
-  printf '#!/usr/bin/env bash\nprintf "argc=%%s|1=<%%s>|2=<%%s>|3=<%%s>|4=<%%s>\\n" "$#" "${1-}" "${2-}" "${3-}" "${4-}" >> "%s"\n' "$CLS_LOG" >"$CLS_SB/automatic-rename.sh"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"\n' "$CLS_LOG" >"$CLS_SB/automatic-rename.sh"
   chmod +x "$CLS_SB/automatic-rename.sh"
 }
-clswait() { # [line count] -- poll until the log is complete (or ~1s passes)
-  local want=${1:-3}
-  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    [ "$(grep -c . "$CLS_LOG" 2>/dev/null)" -ge "$want" ] && break
+clswait() { # poll until the log has 2 lines (or ~10s passes)
+  local attempt
+  for ((attempt=0; attempt<200; attempt++)); do
+    [ "$(grep -c . "$CLS_LOG" 2>/dev/null)" -ge 2 ] && break
     sleep 0.05
   done
   cat "$CLS_LOG"
 }
 
 clsbox hook.bash
-HERDR_PANE_ID=x HAL_HOOK="$CLS_SB/shell/hook.bash" HAL_CWD="$CLS_CWD" /usr/bin/env bash -c \
-  'source "$HAL_HOOK"; cd "$HAL_CWD"; l() { :; }; _har_preexec "l"; _har_preexec "ls -a"; _har_precmd; wait' 2>/dev/null
+# The quoted program runs in the SPAWNED shell, so its $variables are that
+# shell's to expand, not this one's.
+# shellcheck disable=SC2016
+HERDR_PANE_ID=x HAL_HOOK="$CLS_SB/shell/hook.bash" /usr/bin/env bash -c \
+  'source "$HAL_HOOK"; l() { :; }; _har_preexec "l"; _har_preexec "ls -a"; wait' 2>/dev/null
 got=$(clswait)
-check_contains "bash: function passes cwd + shell marker" "$got" "argc=4|1=<preexec>|2=<l>|3=<$CLS_CWD>|4=<shell>"
-check_contains "bash: external passes cwd" "$got" "argc=3|1=<preexec>|2=<ls -a>|3=<$CLS_CWD>|4=<>"
-check_contains "bash: precmd passes cwd" "$got" "argc=3|1=<precmd>|2=<bash>|3=<$CLS_CWD>|4=<>"
+check_contains "bash: function word marked shell"     "$got" "preexec l shell"
+check_contains "bash: external command left instant"  "$got" "preexec ls -a"
+check_absent   "bash: external command not marked"    "$got" "preexec ls -a shell"
 rm -rf "$CLS_SB"
 
 if command -v zsh >/dev/null 2>&1; then
   clsbox hook.zsh
-  HERDR_PANE_ID=x HAL_HOOK="$CLS_SB/shell/hook.zsh" HAL_CWD="$CLS_CWD" zsh -c \
-    'source "$HAL_HOOK"; cd "$HAL_CWD"; function l() { :; }; _har_preexec l l l; _har_preexec "ls -a" "ls -a" "ls -a"; _har_precmd; wait' 2>/dev/null
+  HERDR_PANE_ID=x HAL_HOOK="$CLS_SB/shell/hook.zsh" zsh -c \
+    'source "$HAL_HOOK"; function l() { :; }; _har_preexec l l l; _har_preexec "ls -a" "ls -a" "ls -a"; wait' 2>/dev/null
   got=$(clswait)
-  check_contains "zsh: function passes cwd + shell marker" "$got" "argc=4|1=<preexec>|2=<l>|3=<$CLS_CWD>|4=<shell>"
-  check_contains "zsh: external passes cwd" "$got" "argc=3|1=<preexec>|2=<ls -a>|3=<$CLS_CWD>|4=<>"
-  check_contains "zsh: precmd passes cwd" "$got" "argc=3|1=<precmd>|2=<zsh>|3=<$CLS_CWD>|4=<>"
+  check_contains "zsh: function word marked shell"    "$got" "preexec l shell"
+  check_contains "zsh: external command left instant" "$got" "preexec ls -a"
+  check_absent   "zsh: external command not marked"   "$got" "preexec ls -a shell"
   rm -rf "$CLS_SB"
 else
   echo "# skip: zsh not installed"
@@ -102,12 +120,15 @@ fi
 # portable across NixOS (no /bin) and standard Linux.
 if command -v fish >/dev/null 2>&1; then
   clsbox hook.fish
-  HERDR_PANE_ID=x HAL_HOOK="$CLS_SB/shell/hook.fish" HAL_CWD="$CLS_CWD" fish -c \
-    'source "$HAL_HOOK"; cd "$HAL_CWD"; function l; end; _har_preexec "l"; _har_preexec "/usr/bin/env -a"; _har_precmd' 2>/dev/null
+  # The quoted program runs in the SPAWNED shell, so its $variables are that
+  # shell's to expand, not this one's.
+  # shellcheck disable=SC2016
+  HERDR_PANE_ID=x HAL_HOOK="$CLS_SB/shell/hook.fish" fish -c \
+    'source "$HAL_HOOK"; function l; end; _har_preexec "l"; _har_preexec "/usr/bin/env -a"' 2>/dev/null
   got=$(clswait)
-  check_contains "fish: function passes cwd + shell marker" "$got" "argc=4|1=<preexec>|2=<l>|3=<$CLS_CWD>|4=<shell>"
-  check_contains "fish: external passes cwd" "$got" "argc=3|1=<preexec>|2=</usr/bin/env -a>|3=<$CLS_CWD>|4=<>"
-  check_contains "fish: precmd passes cwd" "$got" "argc=3|1=<precmd>|2=<fish>|3=<$CLS_CWD>|4=<>"
+  check_contains "fish: function word marked shell"    "$got" "preexec l shell"
+  check_contains "fish: external command left instant" "$got" "preexec /usr/bin/env -a"
+  check_absent   "fish: external command not marked"   "$got" "preexec /usr/bin/env -a shell"
   rm -rf "$CLS_SB"
 else
   echo "# skip: fish not installed (classification)"
@@ -131,6 +152,9 @@ else
   echo "# skip: fish not installed"
 fi
 
-# Hook workers are detached; leaving their disposable directory available
-# avoids racing a late worker's mock/state writes during cleanup.
+# The sandbox is only ever written to by the fake herdr, so this is tidy-up, not
+# cleanup that anything depends on. Same form the rest of the suite uses, since
+# the suite is meant to need nothing but bash and jq.
+rm -rf "$HOOKS_SB" 2>/dev/null || true
+
 t_summary

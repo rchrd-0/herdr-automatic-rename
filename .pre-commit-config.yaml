@@ -1,0 +1,45 @@
+# Local gate that runs what CI runs, so a push cannot fail on something a commit
+# could have caught. Install it with `make hooks` (needs prek, or pre-commit).
+#
+# Every hook shells out to a Makefile target instead of naming source files here.
+# Those lists already live in the Makefile and the CI workflow, and a third copy
+# is a third thing to forget.
+#
+# pass_filenames is false throughout for the same reason. These checks are about
+# the repo as a whole (the syntax loop and shellcheck both follow sourced files,
+# the suite runs whole scenarios), not about whichever paths happen to be staged.
+# The `files` patterns only decide whether a hook is worth running at all: a
+# docs-only commit has nothing for shellcheck to say.
+repos:
+  - repo: local
+    hooks:
+      - id: syntax
+        name: bash/zsh/fish syntax
+        entry: make syntax
+        language: system
+        pass_filenames: false
+        files: '(\.(sh|bash|zsh|fish)|tests/mocks/herdr)$'
+
+      - id: shellcheck
+        name: shellcheck
+        entry: make lint-sh
+        language: system
+        pass_filenames: false
+        files: '(\.(sh|bash)|tests/mocks/herdr)$'
+
+      - id: markdownlint
+        name: markdownlint
+        entry: make lint-md
+        language: system
+        pass_filenames: false
+        files: '\.md$'
+
+      # Last, because it is the slow one (~25s) and there is no point paying for
+      # it when a lint above already stopped the commit. Markdown alone cannot
+      # change what the suite does, so that case skips it.
+      - id: tests
+        name: test suite
+        entry: make test
+        language: system
+        pass_filenames: false
+        exclude: '(\.md|^\.github/markdownlint-rules/.*)$'

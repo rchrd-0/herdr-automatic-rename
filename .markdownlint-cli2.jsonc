@@ -1,0 +1,26 @@
+{
+  "customRules": [
+    ".github/markdownlint-rules/no-hard-wrap.js",
+    ".github/markdownlint-rules/no-em-dash.js",
+    ".github/markdownlint-rules/concise-changelog.js"
+  ],
+  "globs": ["**/*.md"],
+  "ignores": ["tmp/**", "plans/**", ".claude/**", "node_modules/**"],
+  "config": {
+    "default": true,
+    // Prose is never hard-wrapped here, so a line-length cap is the one thing
+    // this repo cannot have. no-hard-wrap is the rule that replaces it.
+    "MD013": false,
+    // A Keep a Changelog file repeats "Fixed" and "Added" under every release.
+    // They are never siblings, so the sibling-scoped check still catches a real
+    // duplicate inside one entry.
+    "MD024": { "siblings_only": true },
+    // `[N] ` names the prefix the plugin writes, trailing space included.
+    "MD038": false,
+    // The README's screenshot is an <img> for its width and height attributes.
+    "MD033": false,
+    "no-hard-wrap": true,
+    "no-em-dash": true,
+    "concise-changelog": true
+  }
+}

@@ -7,37 +7,53 @@
 #                 to tabs only.
 #   AUTO_INDEX=1  prefix each workspace, tab, and agent with the 1-9 number of
 #                 its jump keybind (switch_workspace/switch_tab/focus_agent) as
-#                 "[N] <base>". Applies to workspaces, tabs, and agents -- except
-#                 agents, which are numbered only on herdr < 0.7.5 (newer herdr
-#                 rejects a bracketed agent name outright, see ar_agent_prefix_ok)
-#                 and only when the panel is grouped-sorted ("priority" sort
-#                 reorders the panel behind an API we can't read, see
-#                 ar_agent_sort). Agent prefixes are stripped in both cases. On
-#                 herdr >= 0.8.0 it also reports each pane's plain 1-9 tab
-#                 position as the custom sidebar token `tab_number`.
+#                 "[N] <base>". Per-scope overrides AUTO_INDEX_WORKSPACES,
+#                 AUTO_INDEX_TABS and AUTO_INDEX_AGENTS each default to
+#                 AUTO_INDEX and win over it when set, so "numbered tabs, plain
+#                 workspaces" is AUTO_INDEX_WORKSPACES=0 on its own (issue #8).
+#                 Agents are numbered only on herdr < 0.7.5 (newer herdr rejects
+#                 a bracketed agent name outright, see ar_agent_prefix_ok) and
+#                 only when the panel is grouped-sorted ("priority" sort reorders
+#                 the panel behind an API we can't read, see ar_agent_sort).
+#                 Agent prefixes are stripped in both cases.
+#
+# Naming a kind and switching it off does not merely stop numbering: its pass
+# still runs and strips the prefixes already there, so the change is visible on
+# the next event rather than waiting for the "clear" action (see ar_reconcile).
+# Nothing records which prefixes we wrote, so that strip also takes a hand-typed
+# "[1] incident" down to "incident"; ar_strip_prefix's all-digits rule is the
+# whole of the protection, and it is what keeps "[wip] foo" intact.
+#
+# Which is why it is the NAMING that arms it, not the value. A config carrying
+# only AUTO_INDEX=0 predates these settings, has never had us touch its
+# workspace or agent labels, and keeps that no-op behavior on upgrade. Tabs are
+# the exception, and only because they were already stripped this way whenever
+# NAME_TABS was on.
 #
 # Both default on and are configured in config.sh ($HERDR_AUTOMATIC_RENAME_CONFIG). A
 # single unified reconcile drives both: one pass computes a tab's base name and
 # its "[N]" prefix together and issues one rename per item, so a brand-new tab
-# settles at "[3] project" in a single rename with no placeholder flicker.
+# settles at "[3] zsh" in a single rename with no placeholder flicker.
 #
 # Invoked several ways, all routing through ar_run:
 #   * herdr [[events]] hooks:     automatic-rename.sh <event.name>
-#   * shell preexec/precmd hooks: automatic-rename.sh preexec "<cmdline>" "<cwd>" [shell]
-#                                 automatic-rename.sh precmd [<shell-name>] [<cwd>]
+#   * shell preexec/precmd hooks: automatic-rename.sh preexec "<cmdline>"
+#                                 automatic-rename.sh precmd [<shell-name>]
 #   * the "reset" action:         automatic-rename.sh reset      (re-adopt active tab)
 #   * the "clear" action:         automatic-rename.sh --clear    (strip all prefixes)
+#   * the "doctor" action:        automatic-rename.sh doctor     (explain the active tab's name)
 #
 # The live per-command hooks ship with the plugin under shell/ (hook.zsh,
-# hook.bash, hook.fish); each passes its own shell name and cwd to precmd so a
-# bare prompt can use the authoritative directory immediately after `cd`.
+# hook.bash, hook.fish); each passes its own shell name to precmd so a bare
+# prompt in a bash/fish pane reads "bash"/"fish" rather than $SHELL.
 #
 # herdr has no per-tab metadata and no auto/manual flag, so the manual-rename
 # exclusion is tracked here: a JSON state file remembers the last base we set
 # per tab_id and whether auto-naming is still enabled for it. Config and state
 # live at FIXED paths (not $HERDR_PLUGIN_{CONFIG,STATE}_DIR) so the herdr-invoked
-# and shell-invoked runs share one store: the preexec/precmd runs are launched by
-# the shell, not herdr, and never receive the HERDR_PLUGIN_* env vars. Needs jq.
+# and shell-invoked runs share the same store, one per herdr session: the
+# preexec/precmd runs are launched by the shell, not herdr, and never receive
+# the HERDR_PLUGIN_* env vars. Needs jq.
 #
 # Targets bash 3.2 (macOS /bin/bash): no associative arrays, no namerefs.
 
@@ -47,13 +63,92 @@
 # be the test runner when sourced.
 AR_ROOT="${HERDR_PLUGIN_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)}"
 HERDR="${HERDR_BIN_PATH:-herdr}"
+ar_session_name() {
+  local LC_ALL=C dir parent name=""
+  if [ -n "${HERDR_SOCKET_PATH:-}" ]; then
+    dir=${HERDR_SOCKET_PATH%/*}
+    parent=${dir%/*}
+    if [ "$parent" != "$dir" ] && [ "${parent##*/}" = "sessions" ]; then
+      name=${dir##*/}
+    fi
+  else
+    name=${HERDR_SESSION:-}
+  fi
+  case "$name" in
+    ""|default|.|..|*[!a-zA-Z0-9._-]*) return 0 ;;
+    *) [ "${#name}" -le 64 ] && printf '%s' "$name" ;;
+  esac
+  return 0
+}
+
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/herdr-automatic-rename"
+AR_LEGACY_STATE_FILE="$STATE_DIR/state.json"
+_ar_session=$(ar_session_name)
+[ -z "$_ar_session" ] || STATE_DIR="$STATE_DIR/sessions/$_ar_session"
+unset _ar_session
 STATE_FILE="$STATE_DIR/state.json"
 LOCK_DIR="$STATE_DIR/lock"
 RERUN_FLAG="$STATE_DIR/rerun"
 CONFIG_FILE="${HERDR_AUTOMATIC_RENAME_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/herdr-automatic-rename/config.sh}"
-AR_METADATA_SOURCE="herdr-automatic-rename"
-AR_TAB_NUMBER_TOKEN="tab_number"
+
+# `task` is the shape a TITLE arrives in: control characters gone, the leading run
+# of non-alphanumerics gone (an agent parks a spinner glyph there), the agent's own
+# brand gone with it, no trailing space, and inner runs of it collapsed. One
+# normalization, because the refusals in ar_title_clean compare exact strings and
+# the label is what they compared: a title of "Claude Code " used to match no
+# refusal and then be trimmed into a label.
+#
+# The brand is the argument, because it belongs to the agent in the pane and each
+# lift knows which one that is. `brandmap` turns $AR_TITLE_BRANDS (TITLE_BRANDS,
+# newline-joined) into the table `taskof` looks it up in, and `debrand` takes the
+# brand off only at the very front and only when a non-alphanumeric follows it, so a
+# title that merely starts with it keeps it. `lead` runs on BOTH sides of the
+# debrand: a title arrives with anything in front of the brand -- a control
+# character clean turned into a space, herdr's own leading whitespace, a glyph an
+# agent parked there -- and the compare is against the front of the string, so the
+# brand has to be at the front by then (see TITLE_BRANDS in naming.sh, issue #12).
+# Only a pane whose agent HAS a brand pays for either, which is why the pair sits
+# behind one length test: for everything else the second strip could never match.
+#
+# These four live in their own string because only the two title lifts call them,
+# and $AR_JQ_CLEAN is prefixed onto five other jq programs that would compile them
+# for nothing. Concatenate it AFTER $AR_JQ_CLEAN, which is where `clean` and `lc`
+# come from.
+#
+# Every jq below that hands a herdr-supplied string to a shell variable runs it
+# through clean first, and joins its rows on a literal tab rather than using @tsv.
+# @tsv keeps a row parseable by ESCAPING what would break it, and those escapes
+# are the problem: a tab out of argv arrives as the two printable characters \t,
+# which no scrub can tell from text somebody typed, and every backslash in the
+# value is doubled on the way past -- numbering a tab called "C:\temp" rewrote it
+# to "C:\\temp". Removing the control characters instead makes the row
+# unambiguous without touching anything the user can see.
+AR_JQ_CLEAN='def clean: (. // "") | tostring | gsub("[[:cntrl:]]"; " ");
+def lc: clean | ascii_downcase;'
+# The jq below is a PROGRAM, not a string with shell expansions in it, so the
+# single quotes are the point: $b and $brands are jq's own variables, bound by
+# --arg at each call site.
+# shellcheck disable=SC2016
+AR_JQ_TASK='def lead: sub("^[^[:alnum:]]+"; "");
+def brandmap: [ split("\n")[] | capture("^(?<k>[^=]+)=(?<v>.*)$")
+  | { key: (.k | ascii_downcase), value: .v } ] | from_entries;
+def debrand($b): ($b | length) as $n
+  | if (.[:$n] | ascii_downcase) == ($b | ascii_downcase)
+       and (.[$n:] | test("^([^[:alnum:]]|$)")) then .[$n:] else . end;
+def task($b): clean | lead
+  | (if ($b | length) > 0 then debrand($b) | lead else . end)
+  | sub("[[:space:]]+$"; "") | gsub("[[:space:]]+"; " ");
+def taskof($brands; $agent): task($brands[$agent | lc] // "");'
+
+# Those rows are split on the ASCII unit separator rather than a tab, because
+# bash counts a tab as IFS WHITESPACE: `read` collapses a run of them, so one
+# empty field shifts every field after it. A tab with an empty label -- what
+# HIDE_SHELL leaves behind -- parsed its pane count as its label and was never
+# named again. A non-whitespace delimiter keeps empty fields where they belong,
+# and clean has already taken every character of this class out of the values, so
+# it cannot turn up inside one. jq spells it [31] | implode, for the same reason
+# this file cannot: a literal control character in source is unreadable.
+AR_ROW_SEP=$'\037'
 
 # The prerequisite checks, config + naming load, toggle defaults, mode parse, and
 # dispatch all live in ar_main (bottom of file) so that sourcing this file for
@@ -62,6 +157,94 @@ AR_TAB_NUMBER_TOKEN="tab_number"
 # ======================================================================
 # prefix helpers (the "[N] " contract, shared by both features)
 # ======================================================================
+
+# The three toggle predicates. Between them they are the only readers of
+# AUTO_INDEX and the per-kind overrides, so the "an override beats AUTO_INDEX"
+# rule has one implementation and cannot drift between the formatter
+# (ar_desired) and the passes that decide whether to run at all.
+#
+# Each reads the config variables as they were written, resolving the fallback
+# where it is used rather than rewriting the variables up front. That keeps them
+# pure functions of the config: order-independent, idempotent, and unable to
+# lose the difference between a kind the config NAMED and one that inherited its
+# value -- a difference ar_index_pass depends on, and one that a resolve step
+# would have to snapshot before destroying.
+#
+# An unknown kind is off rather than on in all three: every caller passes a
+# literal, so reaching the default means a typo, and refusing to number is the
+# recoverable half of that (a wrong rename is not).
+
+# ar_index_on <workspaces|tabs|agents> -> 0 when that kind is numbered.
+# The ":-1" is where "both features default on" lives for numbering.
+ar_index_on() {
+  case "$1" in
+    workspaces) [ "${AUTO_INDEX_WORKSPACES:-${AUTO_INDEX:-1}}" = "1" ] ;;
+    tabs)       [ "${AUTO_INDEX_TABS:-${AUTO_INDEX:-1}}" = "1" ] ;;
+    agents)     [ "${AUTO_INDEX_AGENTS:-${AUTO_INDEX:-1}}" = "1" ] ;;
+    *)          false ;;
+  esac
+}
+
+# ar_index_explicit <kind> -> 0 when the config named that kind itself rather
+# than inheriting AUTO_INDEX. Set-but-empty does not count, matching the ":-"
+# above, so the two stay in step by construction.
+#
+# This is what separates "I turned workspace numbering off" from "I have had
+# AUTO_INDEX=0 set for a year". Only the first asks for the prefixes already on
+# those rows to be cleaned up; the second is a config that predates the setting
+# and must keep behaving as it did, because the cleanup cannot tell a prefix we
+# wrote from one the user typed (see the strip note at the top of this file).
+ar_index_explicit() {
+  case "$1" in
+    workspaces) [ -n "${AUTO_INDEX_WORKSPACES:-}" ] ;;
+    tabs)       [ -n "${AUTO_INDEX_TABS:-}" ] ;;
+    agents)     [ -n "${AUTO_INDEX_AGENTS:-}" ] ;;
+    *)          false ;;
+  esac
+}
+
+# ar_index_pass <kind> -> 0 when that kind's reconcile pass has work to do.
+#
+# Two ways it can: the kind is numbered, or the config named it and switched it
+# off, which asks for the prefixes already there to be stripped. A kind that
+# merely inherited "off" asks for neither, and gets skipped exactly as it was
+# before per-kind settings existed. --clear overrides all of it, being the
+# uninstall path that strips everything.
+ar_index_pass() {
+  [ "$CLEAR" = "1" ] || ar_index_on "$1" || ar_index_explicit "$1"
+}
+
+# ar_ws_pass -> 0 when the workspace pass has work to do. Numbering is one
+# reason (ar_index_pass), WORKSPACE_SUBSTITUTE_SETS is the other: a rewrite has
+# to reach a workspace whose numbering was never turned on.
+#
+# There is deliberately no third reason. A pass that ran because this plugin
+# OWNS a workspace would run for every config that has ever numbered one, which
+# is every config, and the pass would then be entitled to write to workspaces on
+# a config that asks for nothing. Deleting the rules with numbering on restores
+# the derived names by itself, since the rewrite is derived fresh every pass and
+# an empty rule list is the identity; deleting them with numbering off leaves
+# the last rewrite standing until the `clear` action, which is what that action
+# is for. Neither case is worth a pass that reads state before it knows it has
+# work, and the one-way cost of getting it wrong is a workspace opted out of
+# directory tracking with no `reset` action to bring it back.
+ar_ws_pass() {
+  ar_index_pass workspaces || [ "${#WORKSPACE_SUBSTITUTE_SETS[@]}" -gt 0 ]
+}
+
+# ar_ws_derives -> 0 when the workspace pass will read herdr's own directory
+# derivation, which is also what decides whether it needs the pane list beside
+# it (ar_workspace_pane_dirs is the correction for a session.json that lags).
+#
+# Every pass but --clear derives. --clear derives only when there are rules to
+# undo: with none configured it has no rewrite to hand back, so it stays the
+# pure prefix strip it has always been. Deriving there anyway would have it
+# rename every workspace to wherever identity_cwd points, on the one pass that
+# has no follow-up -- it is documented as the last step before uninstall, and
+# the rename it issues freezes herdr's derivation for good.
+ar_ws_derives() {
+  [ "$CLEAR" != "1" ] || [ "${#WORKSPACE_SUBSTITUTE_SETS[@]}" -gt 0 ]
+}
 
 # ar_strip_prefix <label> -> label with a leading "[<digits>] " removed. Only
 # strips when the bracketed part is all digits (so user text like "[wip] foo" is
@@ -110,16 +293,154 @@ ar_index_prefix() {
   esac
 }
 
-# ar_desired <position> <base> -> the label this item should have.
-#   --clear             -> always the bare base (strip numbering)
-#   AUTO_INDEX off       -> bare base (self-heals a stale prefix as items reconcile)
-#   AUTO_INDEX on, 1..9  -> "[N] base"
+# ar_host_tag -> "HPmini: " -- this machine's short hostname joined to
+# HOST_PREFIX_SEP, or "" when `uname -n` answers nothing. The tag is computed
+# from config alone (the DNS domain dropped, then every HOST_PREFIX_STRIP
+# substring removed, so a fleet naming prefix such as "Omarchy-" keeps the
+# short machine name on the tab). Cached in AR_HOST_TAG: one uname per
+# invocation however many tabs ask.
+#
+# The tag answers with a non-empty hostname whether or not HOST_PREFIX is set:
+# whether a tag may be PREPENDED is the caller's question (the knob), and
+# whether one may be TAKEN OFF is a different one (ar_tag_strip_ok: --clear,
+# or a row the store says we tagged). Keeping the spelling derivable
+# with the knob off is what lets a tagged row heal without waiting for a
+# config that is no longer there.
+ar_host_tag() {
+  local h s
+  if [ -n "${AR_HOST_TAG+x}" ]; then printf '%s' "$AR_HOST_TAG"; return; fi
+  AR_HOST_TAG=''
+  h=$(uname -n 2>/dev/null) || h=''
+  h=${h%%.*}
+  for s in ${HOST_PREFIX_STRIP[@]+"${HOST_PREFIX_STRIP[@]}"}; do
+    h=${h//"$s"/}
+  done
+  # The separator is composed even when the hostname is not, while the feature
+  # is on: an empty host is a diagnosis (uname answered nothing, or the strip
+  # list ate the whole name), and a bare ": " leading the first tab tells that
+  # apart from HOST_PREFIX being off -- which keeps the tag empty so a label
+  # nobody prefixed is never stripped of one. A non-empty host keeps the old
+  # contract above.
+  if [ -n "$h" ] || [ "${HOST_PREFIX:-0}" = "1" ]; then
+    AR_HOST_TAG="${h}${HOST_PREFIX_SEP-": "}"
+  fi
+  printf '%s' "$AR_HOST_TAG"
+}
+
+# ar_tag_strip_ok <tab_id> -> "1" or "0": may the host tag layers be taken off
+# this tab's label? Two answers say yes: --clear (the documented residue-free
+# way out) and the store row recording that WE put a tag on this tab. The
+# knob is deliberately absent: it only ever licenses adding a tag, and a
+# label reading "host: something" on a tab the store never tagged is likelier
+# a hand name than residue -- the store is the one witness that can tell them
+# apart, and a hand rename cannot pre-record itself. A store the pass could
+# not read answers 0: stripping against an unreadable record is how a hand
+# rename gets eaten. The price sits in the opposite corner: a session that
+# lost its state file meets its own old tags as strangers, and keeps them
+# (numbered like any hand name, never stacked) until clear takes them off.
+ar_tag_strip_ok() { # <tab_id>
+  if [ "$CLEAR" = "1" ]; then printf '1'; return; fi
+  ar_row_tagged_p "$1" && printf '1' || printf '0'
+}
+
+# ar_tag_residue_p <label> <auto> -> 0 when <label> reads as this machine's
+# tag under a separator the config no longer spells: the head is the host
+# name ar_host_tag derives, the tail is the exact base the store remembers,
+# and at least one character joins them (the separator nobody can recompute).
+# Called only for a row whose `tagged` says we wrote a tag, which is the
+# receipt telling this apart from a hand name that happens to start with the
+# machine name and end like ours.
+ar_tag_residue_p() { # <label> <auto>
+  local h sep
+  sep=${HOST_PREFIX_SEP-": "}
+  h=$(ar_host_tag); h=${h%"$sep"}
+  [ -n "$h" ] || return 1
+  case "$1" in "$h"?*"$2") return 0 ;; esac
+  return 1
+}
+
+# ar_tag_head_p <base> [tag_ok] -> 0 when a tag strip would be allowed on this
+# tab (tag_ok, the same permission ar_tab_strip_prefix takes) AND <base>
+# starts with this machine's host name: a tag is sitting ahead of it in a
+# spelling the strip could not take off, so nothing may be prepended to it.
+# Without the permission there is no tag interpretation at all, which is what
+# keeps a hand name starting with the machine name treated like any other on
+# a session that never set the knob. A base that genuinely starts with the
+# machine name (a project named after the machine) reads the same and loses
+# the tag for as long as it does; the label alone cannot tell the two apart,
+# and this is the side that never stacks.
+ar_tag_head_p() { # <base> [tag_ok]
+  [ "${2:-}" = "1" ] || return 1
+  local h sep
+  sep=${HOST_PREFIX_SEP-": "}
+  h=$(ar_host_tag); h=${h%"$sep"}
+  [ -n "$h" ] || return 1
+  case "$1" in "$h"?*|"$h") return 0 ;; esac
+  return 1
+}
+
+# ar_row_tagged_p <tab_id> -> 0 when the store row records that we tagged
+# this tab, independent of the knob and --clear (the two other reasons a tag
+# strip may be allowed). The residue guard uses it to tell a row carrying our
+# own unspellable tag from a hand name a knob-on session happens to start
+# with the machine name.
+ar_row_tagged_p() { # <tab_id>
+  ar_state_rows
+  [ -z "${AR_STATE_ROWS_BAD:-}" ] || return 1
+  case "$(ar_state_fields "$1")" in *"${AR_ROW_SEP}true") return 0 ;; esac
+  return 1
+}
+
+# ar_tab_strip_prefix <label> [tag_ok] -> label with the plugin's outer layers
+# removed, outermost first, until nothing plugin-shaped leads it. With tag_ok
+# falsy (the default, and every workspace and agent call) only the "[N] " number
+# layers peel: a session that never set HOST_PREFIX leaves a hand-typed
+# "HPmini: fish" alone. With tag_ok truthy the host tag layers join in: the
+# exact tag, the bare separator while the knob is on (the spelling an empty
+# host evaluation writes), and a residue cut.
+#
+# The residue cut is for a tag spelled under rules nobody can recompute -- the
+# host evaluated differently one pass, strip rules edited, a separator the
+# config that named it no longer holds. Such a tag still sits ahead of the
+# plugin's own bracketed number, so everything through the first "<sep>[N] "
+# comes off; the separator ahead of the bracket is what makes the cut refuse a
+# plain hand name, where "notes [2] draft" keeps every word (a bracket in the
+# middle of a label is not residue). What the cut takes off had to look like a
+# tag: something joined to our number by the configured separator.
+#
+# The layers loop because more than one can sit there legitimately (tag, then
+# number), and because a healed spelling can reveal another beneath it.
+ar_tab_strip_prefix() {
+  local s=$1 tag='' bare='' sep='' prev=''
+  if [ "$2" = "1" ]; then
+    tag=$(ar_host_tag)
+    sep=${HOST_PREFIX_SEP-": "}
+    if [ "${HOST_PREFIX:-0}" = "1" ]; then bare=$sep; fi
+  fi
+  while [ -n "$s" ] && [ "$s" != "$prev" ]; do
+    prev=$s
+    s=${s#"$tag"}
+    s=${s#"$bare"}
+    s=$(ar_strip_prefix "$s")
+    if [ "$s" = "$prev" ] && [ "$2" = "1" ]; then
+      case "$s" in
+        *"$sep"\[[0-9]*\]\ *) s=${s#*"$sep"\[[0-9]*\] } ;;
+      esac
+    fi
+  done
+  printf '%s' "$s"
+}
+
+# ar_desired <scope> <position> <base> -> the label this item should have.
+#   --clear              -> always the bare base (strip numbering)
+#   scope off            -> bare base (self-heals a stale prefix as items reconcile)
+#   scope on, 1..9       -> "[N] base"
 # Any other position -> bare base, because no keybind reaches the item: it sits
 # past the 9th slot, or (position 0) the sidebar does not render it at all, which
 # is how ar_workspace_positions reports a row hidden inside a collapsed space.
 ar_desired() {
-  local n=$1 base=$2
-  if [ "$CLEAR" = "1" ] || [ "$AUTO_INDEX" != "1" ]; then printf '%s' "$base"; return; fi
+  local scope=$1 n=$2 base=$3
+  if [ "$CLEAR" = "1" ] || ! ar_index_on "$scope"; then printf '%s' "$base"; return; fi
   if [ "$n" -ge 1 ] && [ "$n" -le 9 ]; then
     # An empty base (a HIDE_SHELL tab) is numbered "[3]", not "[3] " -- herdr
     # would drop the trailing space anyway, and ar_strip_prefix reads the bare
@@ -152,22 +473,151 @@ ar_is_placeholder() {
 # release-recheck-reacquire dance in ar_run is safe. 30s is comfortably longer
 # than any normal full pass, so a slow run is not stolen out from under itself.
 AR_LOCK_TOKEN="$$-${RANDOM:-0}-$(date +%s 2>/dev/null || echo 0)"
+
+# ar_lock_mtime <dir> <fallback> -> that directory's mtime in epoch seconds, or
+# the fallback when neither stat spelling answers (GNU takes -c, BSD takes -f).
+# Read three times per steal, which is the whole reason it is a function.
+#
+# mtime and not ctime, on purpose: a lock's mtime is when its owner file was
+# written, which is what "abandoned" is measured from. Note what that costs on the
+# moved-aside copy, since it is not obvious -- `mv` is a rename and a rename does
+# not touch the moved directory's mtime, so that copy still carries the age it had
+# before the move. Which is exactly what the freshness check below wants to read;
+# it is only worth writing down because a check for "was this moved recently"
+# cannot be built on it, and one was, and it was dead code that read as working.
+ar_lock_mtime() {
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || printf '%s' "$2"
+}
+# ar_lock_stamp -> put our token in the lock we just created, and say whether it
+# landed. A redirection that fails is reported by the SHELL, before printf runs, so
+# the `2>/dev/null` that used to sit here silenced nothing and the caller was told
+# it held a lock carrying no token: it would reconcile, and its own ar_unlock would
+# match nothing and release nothing. The lock path can be gone by now, taken away
+# by another contender's steal between our mkdir and this write.
+ar_lock_stamp() {
+  { printf '%s' "$AR_LOCK_TOKEN" > "$LOCK_DIR/owner"; } 2>/dev/null || return 1
+  # OUR token, not merely a non-empty file: granted has to mean the same thing
+  # ar_unlock later checks, or a pass can hold a lock it will never release. The
+  # write can land somewhere that is no longer ours, since a steal can take the
+  # name away between the mkdir above and this line.
+  [ "$(cat "$LOCK_DIR/owner" 2>/dev/null)" = "$AR_LOCK_TOKEN" ]
+}
+
+# Give the lock name back after a write to its owner file did not land. `rmdir`
+# alone cannot: the shell creates `owner` the moment it opens the redirect, so a
+# write that died on ENOSPC or a quota leaves a zero-byte file behind and the
+# rmdir fails on it. What stands is the very thing every caller below is trying
+# to avoid, a lock carrying a token nothing matches, which ar_unlock will not
+# touch and no contender may steal until it ages out 30 seconds later.
+# Only an EMPTY owner file is removed. A non-empty one is a whole token, and a
+# steal can take this name away between our mkdir and the write that failed, so
+# the file would be the live holder's rather than ours.
+ar_lock_giveback() {
+  [ -s "$LOCK_DIR/owner" ] || rm -f "$LOCK_DIR/owner" 2>/dev/null
+  rmdir "$LOCK_DIR" 2>/dev/null
+}
 ar_lock() {
   if mkdir "$LOCK_DIR" 2>/dev/null; then
-    printf '%s' "$AR_LOCK_TOKEN" > "$LOCK_DIR/owner" 2>/dev/null
-    return 0
+    ar_lock_stamp && return 0
+    # A stamp that could not land leaves a lock nobody holds: ar_unlock matches no
+    # token in it and no contender may steal it while its mtime is fresh, so every
+    # event after this one does nothing. Give the name back. Reachable without any
+    # race at all -- a umask of 222 makes every mkdir here unwritable, and so do
+    # ENOSPC, a quota, and a read-only remount.
+    ar_lock_giveback
+    return 1
   fi
-  local now mt age
+  local now mt age stale
   now=$(date +%s 2>/dev/null || echo 0)
-  mt=$(stat -c %Y "$LOCK_DIR" 2>/dev/null || stat -f %m "$LOCK_DIR" 2>/dev/null || echo "$now")
+  mt=$(ar_lock_mtime "$LOCK_DIR" "$now")
   age=$(( now - mt ))
   if [ "$age" -gt 30 ]; then
-    rm -f "$LOCK_DIR/owner" 2>/dev/null
-    rmdir "$LOCK_DIR" 2>/dev/null
-    if mkdir "$LOCK_DIR" 2>/dev/null; then
-      printf '%s' "$AR_LOCK_TOKEN" > "$LOCK_DIR/owner" 2>/dev/null
-      return 0
+    # Read the age once more, right before acting on it. Between the first read
+    # and here another contender can have stolen this lock, rebuilt it and started
+    # working, and moving THAT aside is what strands a live holder and frees the
+    # name for a third. Re-reading does not close the race, nothing available to a
+    # shell can, but it stops a burst from cascading: each loser that moves the
+    # winner's brand-new lock opens another window doing it. Measured over 200
+    # trials of six contenders against one abandoned lock, this line is the
+    # difference between 23 trials that produced two holders and none of them.
+    # Fail SAFE, like the read above: an unreadable lock stands in as age 0 and is
+    # refused. The fallback used to be epoch 0, which reads as 55 years old and
+    # authorizes the steal, and the lock path is routinely unreadable here -- it is
+    # the one fork between another stealer's mv and its reservation. Measured, that
+    # fallback fired 213 times over 60 bursts and every one of them moved whatever
+    # brand-new lock had appeared at that path.
+    now=$(date +%s 2>/dev/null || echo 0)
+    mt=$(ar_lock_mtime "$LOCK_DIR" "$now")
+    [ $(( now - mt )) -gt 30 ] || return 1
+    # Claim the right to steal in ONE step. The old sequence was rm + rmdir +
+    # mkdir, and a second contender's rm emptied the lock the FIRST one had just
+    # created: its rmdir then took that fresh lock away and its mkdir handed it a
+    # parallel claim, so two passes ran at once and their whole-file state writes
+    # clobbered each other -- which reads, one pass later, as a tab renamed by
+    # hand, and opts it out of naming for good. `mv` onto a name that does not
+    # exist is a single rename(2), so exactly one contender wins it and every
+    # loser finds no source left to move. The destination carries the whole token,
+    # not just $$, so residue from a crashed run with a recycled pid cannot be
+    # mistaken for a free name.
+    stale="$LOCK_DIR.stale.$AR_LOCK_TOKEN"
+    # Clear our own destination first. `mv` onto an existing directory moves the
+    # source INSIDE it, and the nested lock is then invisible to everything below:
+    # its token cannot be read, so it looks unclaimed, and the rm that follows
+    # destroys a live holder's lock and frees the name for a second pass. Only
+    # residue left by a dead run of this same token can put something there, and
+    # the token is weaker than it looks (a fresh $RANDOM moves by a fixed step per
+    # pid), so the guard is cheap next to what it prevents. plans/001 named this
+    # exact nesting as a stop-and-report condition.
+    rm -rf -- "$stale" 2>/dev/null
+    mv "$LOCK_DIR" "$stale" 2>/dev/null || return 1
+    # RESERVE the name before deciding anything, one syscall after the move. The
+    # move leaves the lock path empty, and the age that authorized it was measured
+    # on a directory this mv no longer moves: two contenders can both find one lock
+    # stale, and the second arrives here after the first has already stolen it,
+    # rebuilt it and started reconciling, so what it just moved aside is a LIVE
+    # lock. While the path stands empty a third contender wins the plain mkdir at
+    # the top of this function and reconciles beside a holder that never lost its
+    # lock, which is the double-holder this whole function exists to prevent.
+    # Taking the name first shuts that window at one syscall and leaves the freshness
+    # question to be answered at leisure, by whoever now holds the name.
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+      rm -rf -- "$stale" 2>/dev/null            # lost the reservation; drop the copy
+      return 1
     fi
+    now=$(date +%s 2>/dev/null || echo 0)
+    mt=$(ar_lock_mtime "$stale" "$now")
+    if [ $(( now - mt )) -le 30 ]; then
+      # What we moved was somebody's live lock. Put their token in the lock we now
+      # hold, so their own ar_unlock still recognizes it and releases it, and lose
+      # the race ourselves. Copying the token rather than moving the directory back
+      # is deliberate: `mv` onto a name that exists moves the source INSIDE it, so
+      # a hand-back would nest their lock in ours and leave a directory ar_unlock
+      # can never rmdir.
+      # Read the token BEFORE writing anywhere: `>` truncates its target before cat
+      # runs, so a victim with no token yet had ours erase whatever it wrote into the
+      # directory we reserved, and a lock with an empty owner is one nothing can
+      # release until it ages out. When there is no token to hand back, nobody had
+      # claimed that lock either, so let the name go instead of parking an ownerless
+      # lock on it. Both of those measured as the common case, not the rare one.
+      # The write is braced and checked for the same reason the stamp above is: the
+      # shell reports a failed redirection itself, so an unbraced `2>/dev/null`
+      # silences nothing and the error lands on the user's prompt, these being
+      # preexec hooks. And a hand-back that did not land leaves the same ownerless
+      # lock as a failed stamp, so it ends the same way, by giving the name back.
+      local vic
+      vic=$(cat "$stale/owner" 2>/dev/null)
+      rm -rf -- "$stale" 2>/dev/null
+      if [ -n "$vic" ] && { printf '%s' "$vic" > "$LOCK_DIR/owner"; } 2>/dev/null; then
+        :
+      else
+        ar_lock_giveback
+      fi
+      return 1
+    fi
+    rm -rf -- "$stale" 2>/dev/null
+    ar_lock_stamp && return 0
+    ar_lock_giveback                        # same as above: never leave it ownerless
+    return 1
   fi
   return 1
 }
@@ -177,55 +627,281 @@ ar_unlock() {
   rmdir "$LOCK_DIR" 2>/dev/null || true
 }
 
-# ======================================================================
-# naming state (atomic temp+mv; jq keyed by tab_id; only NAME_TABS uses it)
-# ======================================================================
-# ar_state_read -> one JSON object. Missing or malformed data starts a fresh
-# store; a file read failure or a jq process failure must not erase good state.
-ar_state_read() {
-  local base="" out rc
-  if [ -f "$STATE_FILE" ]; then
-    base=$(cat "$STATE_FILE" 2>/dev/null) || return 1
-  elif [ -e "$STATE_FILE" ]; then
-    return 1
-  fi
-  [ -n "$base" ] || { printf '{}'; return 0; }
-  out=$(printf '%s' "$base" | jq -c -s \
-    'if length == 1 and (.[0] | type) == "object" then .[0] else {} end' 2>/dev/null)
+# ar_state_seed - a named session's first store starts from the ownership records
+# of the shared store it replaces. Without this an upgrade opts every named tab
+# out: the tab carries a label the empty store never wrote, which is what a hand
+# rename looks like. Only enabled records are copied. A matching one keeps the
+# tab named, a mismatched one opts out exactly as no record would, and an
+# opted-out one is left behind so a placeholder label is adopted as it would be
+# from nothing. Ids this session lacks go on the first prune. The link is what
+# makes the copy safe under a burst of first events: it refuses an existing
+# file, so a pass that already wrote is never covered over.
+#
+# Every copied record is marked `seeded`, and the mark is what makes the second
+# sentence above true. The root store is not only the store an upgrade leaves
+# behind: it is the DEFAULT session's live store, and it stays populated for as
+# long as anybody uses that session. So a session created later seeds from it
+# too, and because every herdr server numbers its tabs from w1:t1 the copied
+# record lands on a tab that has nothing to do with it. That tab still carries
+# herdr's generated number, and an owned record against a placeholder label is
+# what a hand rename looks like -- so the session's own first tab opted itself
+# out for good, needing the reset action per tab, which is this bug one layer
+# along. A seeded record is a claim about another store's tab rather than a
+# write of ours, so ar_name_eligible confirms it against the label and drops it
+# when the label disagrees, leaving the tab exactly as unseen as it really is.
+#
+# Nothing has to clear the mark: ar_state_set writes a record whole, so the
+# first write of ours replaces it. A seeded record that MATCHES its label keeps
+# the mark, and costs nothing for it -- the label agrees, so the record is ours
+# in everything but provenance, and a later hand rename reaches the same
+# opted-out end state by the drop-and-re-examine path instead of directly.
+ar_state_seed() {
+  [ "$STATE_FILE" != "$AR_LEGACY_STATE_FILE" ] || return 0
+  [ ! -e "$STATE_FILE" ] || return 0
+  [ -f "$AR_LEGACY_STATE_FILE" ] || return 0
+  local base seeded rc tmp
+  base=$(cat "$AR_LEGACY_STATE_FILE" 2>/dev/null) || return 1
+  seeded=$(printf '%s' "$base" | jq -c -s '
+    if length == 1 and (.[0] | type) == "object" then
+      .[0] | with_entries(
+        select((.value | type) == "object")
+        | select(.value.enabled == true and (.value.auto | type) == "string")
+        | .value += {seeded: true})
+    else empty end' 2>/dev/null)
   rc=$?
-  case "$rc" in
-    0)     printf '%s' "$out" ;;
-    # Parse errors use 4 or 5 across jq releases. Invocation/compile failures
-    # (2/3), or a killed/missing process, are not evidence of corrupt data.
-    4|5)   printf '{}' ;;
-    *)     return 1 ;;
-  esac
-}
-
-ar_state_get() { # <tab_id> <field>
-  local base
-  base=$(ar_state_read) || return 1
-  # NOT `.[$t][$f] // empty`: `//` treats a boolean `false` as absent, so the
-  # `enabled` flag would read back as "" and an opted-out tab would look
-  # first-seen on every pass (re-adopting a deliberately numeric name). Emit the
-  # value unless it is genuinely null/missing.
-  printf '%s' "$base" | jq -r --arg t "$1" --arg f "$2" \
-    '.[$t][$f] as $v | if $v == null then empty else $v end' 2>/dev/null
-}
-ar_state_set() { # <tab_id> <auto-name> <enabled true|false>
-  local base updated tmp
-  base=$(ar_state_read) || return 1
-  updated=$(printf '%s' "$base" | jq -c --arg t "$1" --arg a "$2" --argjson e "$3" \
-    '.[$t] = {auto: $a, enabled: $e}' 2>/dev/null) || return 1
-  [ "$updated" = "$base" ] && return 0
-  tmp=$(mktemp "$STATE_DIR/.state.XXXXXX") || return 1
-  if { printf '%s' "$updated" > "$tmp"; } 2>/dev/null && mv "$tmp" "$STATE_FILE"; then
-    return 0
+  case "$rc" in 0) ;; 4|5) return 0 ;; *) return 1 ;; esac
+  [ -n "$seeded" ] || return 0
+  tmp=$(mktemp "$STATE_DIR/.seed.XXXXXX") || return 1
+  if { printf '%s' "$seeded" > "$tmp"; } 2>/dev/null; then
+    if ln "$tmp" "$STATE_FILE" 2>/dev/null || [ -f "$STATE_FILE" ]; then
+      AR_STATE_ROWS_LOADED=""
+      rm -f "$tmp"
+      return 0
+    fi
   fi
   rm -f "$tmp"
   return 1
 }
+
+# ======================================================================
+# naming state (atomic temp+mv; jq keyed by tab_id; only NAME_TABS uses it)
+# ======================================================================
+# ar_state_read -> the state object as JSON, or "{}" when the file is missing OR
+# unparseable. The two are the same answer: nothing is known about any tab. They
+# used to differ, and that is the bug -- every writer below starts from this file,
+# so one jq could not parse froze the store forever. The tab whose ownership went
+# with it reads as hand-renamed on the next pass, opts out, and the reset action
+# cannot bring it back either, since re-adopting it is another write. Naming was
+# dead for the session with nothing said and no way back but deleting the file.
+#
+# It answers with ONE object, and slurps to be sure of it. jq reads top-level
+# values as a STREAM, so `type == "object"` alone says yes to a file holding two
+# of them and hands the pair straight back: the writers then apply their update
+# to each document and write both out, so that file stays multi-document for
+# good, and ar_state_get starts emitting one value per document into a variable
+# no comparison in the opt-out machine can match. Requiring `length == 1` is
+# what makes "unreadable" cover every shape a state file can be broken into.
+# An array or a bare null is refused for the same reason: it parses, it is not a
+# store, and assigning a key into it is not a write this file can come back from.
+#
+# One extra jq per write is what validating costs. Writes are the rare path,
+# because ar_state_claim skips one whose state already says what the pass just
+# computed, which is the steady state for every named tab on every event.
+ar_state_read() {
+  local base=""
+  [ ! -e "$STATE_FILE" ] || [ -f "$STATE_FILE" ] || return 1
+  # A file we could not READ is not an empty store, and answering {} for it is
+  # how a good state file gets destroyed: the writer below starts from that {}
+  # and moves a one-key file over the top, so every other tab's record goes, and
+  # each of those tabs then carries a label state knows nothing about -- a name
+  # typed by hand, as far as the next pass can tell, so each opts itself out.
+  # Callers must not write on a non-zero return.
+  #
+  # The tell is cat's own exit status, NOT whether bytes are left on disk. A file
+  # holding a newline and nothing else reads back empty, because command
+  # substitution strips trailing newlines, and it still has a byte in it: judging
+  # by size refuses to heal it and freezes the store exactly the way an
+  # unparseable file used to. `echo > state.json` during a hand recovery makes
+  # one. A file that has genuinely gone (deleted between the -f and the cat)
+  # fails the read and is refused once, which the next pass reads as missing.
+  if [ -f "$STATE_FILE" ] && ! base=$(cat "$STATE_FILE" 2>/dev/null); then
+    return 1
+  fi
+  [ -n "$base" ] || { printf '{}'; return 0; }
+  # The {} answer is for a file jq READ and could not use. jq exits 5 for that
+  # (a parse error, or a runtime error in the filter) and 0 otherwise, so any
+  # other status is jq itself not running: killed, out of memory, a broken
+  # install. Healing on that arm handed the next writer a {} to start from, and
+  # it moved a one-key file over a store that was fine all along.
+  local out rc
+  out=$(printf '%s' "$base" | jq -c -s \
+    'if length == 1 and (.[0] | type) == "object" then .[0] else {} end' 2>/dev/null)
+  rc=$?
+  case "$rc" in
+    0) printf '%s' "$out" ;;
+    # jq ran and refused the input. Which status a parse error gets moved between
+    # jq releases (1.6 and 1.7 disagree). Invocation/compile errors (2/3)
+    # are tool failures, and must preserve the existing store.
+    4|5) ar_trace "state file healed to {}"; printf '{}' ;;
+    *) return 1 ;;
+  esac
+}
+
+# ar_state_get reads the file directly and needs no repair path: an unreadable
+# file yields no value, and no value already means "nothing known about this tab".
+ar_state_get() { # <tab_id> <field>
+  [ -f "$STATE_FILE" ] || return 0
+  # NOT `.[$t][$f] // empty`: `//` treats a boolean `false` as absent, so the
+  # `enabled` flag would read back as "" and an opted-out tab would look
+  # first-seen on every pass (re-adopting a deliberately numeric name). Emit the
+  # value unless it is genuinely null/missing.
+  jq -r --arg t "$1" --arg f "$2" '.[$t][$f] as $v | if $v == null then empty else $v end' \
+    "$STATE_FILE" 2>/dev/null
+}
+# <ws> is the base label of the workspace the tab was in when it was named. It
+# is recorded so the shell hook can dedupe the context against it (see
+# ar_context_dir) without a herdr call of its own on every prompt. Absent for
+# every key but a named tab's, and dropped rather than written empty.
+#
+# Last known good, not current: a workspace renamed, or a tab dragged into
+# another one, leaves it stale until the next reconcile. That pass is the one
+# that changes the label anyway -- a dedupe that flips is a different label --
+# so the staleness costs at most the label a tab already had.
+# The whole store as one row per key, loaded once per pass. Every writer below
+# clears it, so a read after a write goes back to the file. The rows are the
+# same five fields ar_state_fields hands out, led by the key they belong to.
+#
+# One jq for the pass rather than one per tab: a pass reads these fields for
+# every tab and every workspace it sees, and the file does not change between
+# those reads except through the writers in this file. (ar_identity_base scans
+# a pre-loaded blob the same way, for the same reason.)
+AR_STATE_ROWS=""
+AR_STATE_ROWS_LOADED=""
+AR_STATE_ROWS_BAD=""
+ar_state_load() {
+  AR_STATE_ROWS=""
+  AR_STATE_ROWS_LOADED=1
+  AR_STATE_ROWS_BAD=""
+  if [ -e "$STATE_FILE" ] && [ ! -f "$STATE_FILE" ]; then AR_STATE_ROWS_BAD=1; return 0; fi
+  [ -f "$STATE_FILE" ] || return 0
+  # A record that is not an object is skipped, not fatal: one hand-edited key
+  # used to abort the whole jq, and every tab after it read as unseen and opted
+  # out, where the per-key read this replaced lost only that key. A file jq
+  # rejects outright reads as an empty store, which is what ar_state_read heals
+  # it to on the next write (the opt-out that write records is what makes reset
+  # work again; see the comment above ar_state_read). Only a jq that did not
+  # run at all leaves the store UNKNOWN for the pass, and unknown is not empty:
+  # ar_state_fields answers nothing, and the eligibility checks refuse to write
+  # against a store they could not read.
+  #
+  # The file is read by cat first, as ar_state_read reads it: jq opening the path
+  # itself reports a file it cannot read with the same status as one it cannot
+  # parse, and only the second of those is an empty store. Every joined field is
+  # a string by construction (tostring), so a record whose auto or ws is an
+  # array is one bad row rather than a jq that stops mid-file.
+  local base rc=0
+  if ! base=$(cat "$STATE_FILE" 2>/dev/null); then AR_STATE_ROWS_BAD=1; return 0; fi
+  [ -n "$base" ] || return 0
+  AR_STATE_ROWS=$(printf '%s' "$base" | jq -r -s 'if length == 1 and (.[0] | type) == "object" then .[0] else {} end | to_entries[]
+    | select(.value | type == "object") | .value as $r
+    | [ .key, ($r.enabled | if . == null then "" else tostring end),
+        (($r.auto // "") | tostring), (($r.ws // "") | tostring),
+        ($r.seeded | if . == true then "true" else "" end),
+        ($r.tagged | if . == true then "true" else "" end) ] | join([31] | implode)' \
+    2>/dev/null) || rc=$?
+  case "$rc" in
+    0) ;;
+    4|5) AR_STATE_ROWS="" ;;
+    *) AR_STATE_ROWS=""; AR_STATE_ROWS_BAD=1 ;;
+  esac
+}
+# ar_state_rows - have the rows loaded in THIS shell. ar_state_fields loads on
+# demand as well, but every caller reads it through `$(...)`, and a load done
+# inside that subshell dies with it: the pass would read the file once per tab
+# again, which is the fork this whole memo exists to remove. Callers run this
+# on the line before the substitution.
+ar_state_rows() { [ -n "${AR_STATE_ROWS_LOADED:-}" ] || ar_state_load; }
+
+# ar_state_fields <key> -> "<enabled><SEP><auto><SEP><ws><SEP><seeded><SEP><tagged>"
+# for that key, empty throughout when nothing is known about it. A scan of the
+# loaded rows, no fork: the five fields the opt-out machine reads together are
+# read on every tab of every pass.
+#
+# `read -r k rest` with the row separator as IFS: `rest` keeps the remaining
+# fields WITH their separators, which is the line the callers' own read splits.
+# A non-whitespace IFS keeps a trailing empty field (`seeded` and `tagged`
+# usually are), so the separator must never become a tab.
+#
+# `seeded` and `tagged` go last so a reader that names fewer variables collects
+# what follows in its own final one and discards it there, rather than
+# appending it to a field it compares against. `tagged` rides after `seeded`
+# for the same reason one more level down.
+#
+# `enabled` is emitted as its own text rather than through `//`, which treats a
+# boolean false as absent: an opted-out tab would read back as first-seen on
+# every pass and re-adopt a name somebody typed.
+ar_state_fields() { # <key>
+  ar_state_rows
+  local k rest
+  while IFS=$AR_ROW_SEP read -r k rest; do
+    [ "$k" = "$1" ] || continue
+    printf '%s' "$rest"
+    return 0
+  done <<< "$AR_STATE_ROWS"
+  return 0
+}
+ar_state_set() { # <tab_id> <auto-name> <enabled true|false> [ws] [tagged true|""]
+  local base tmp
+  AR_STATE_ROWS_LOADED=""                  # the loaded rows are about to be stale
+  base=$(ar_state_read) || return 1        # unreadable: leave the file alone
+  # A write that did not land reports it. Ownership IS this file, so swallowing a
+  # full disk or an unwritable state directory told the reset action a tab was
+  # re-adopted while the next pass, finding no entry, opted it straight back out.
+  # The row is written whole, so a claim that carries no `tagged` drops the key
+  # from a row that had it: that is how a healed tab stops being strippable.
+  # Rows the feature never touches keep their exact old shape, and a state file
+  # from before HOST_PREFIX reads every `tagged` as false by its absence.
+  tmp=$(mktemp "$STATE_DIR/.state.XXXXXX") || return 1
+  if printf '%s' "$base" | jq --arg t "$1" --arg a "$2" --argjson e "$3" --arg w "${4:-}" --arg g "${5:-}" \
+       '.[$t] = ({auto: $a, enabled: $e}
+                  + (if $w == "" then {} else {ws: $w} end)
+                  + (if $g == "true" then {tagged: true} else {} end))' > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$STATE_FILE" || return 1
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+}
+# ar_state_retag <tab_id> <0|1> - mark or unmark the row's `tagged` while every
+# other field stays as it is. The reconcile calls this on passes that moved a
+# tag without computing a name (a procinfo blip on an owned tab, a first tab
+# still on herdr's placeholder): the label carries the tag either way, and the
+# row is the only record that lets a later pass with the knob off take it back
+# off instead of reading it as the user's text. Unmarking drops the key rather
+# than writing false, so a row the feature healed keeps the shape it had before
+# it was ever tagged. Skipped when the row already says it: this runs on every
+# nameless pass, and a quiet session must not rewrite the store per tab.
+ar_state_retag() { # <tab_id> <0|1>
+  local base tmp cur=0 filter
+  case "$(ar_state_fields "$1")" in *"${AR_ROW_SEP}true") cur=1 ;; esac
+  [ "$cur" = "$2" ] && return 0
+  AR_STATE_ROWS_LOADED=""                  # the loaded rows are about to be stale
+  base=$(ar_state_read) || return 1        # unreadable: leave the file alone
+  tmp=$(mktemp "$STATE_DIR/.state.XXXXXX") || return 1
+  # The two filters are jq programs: $t is jq's --arg variable, not a shell
+  # expansion, so the single quotes are the point.
+  # shellcheck disable=SC2016
+  if [ "$2" = "1" ]; then filter='.[$t] = ((.[$t] // {}) + {tagged: true})'
+  else filter='if (.[$t] | type) == "object" then del(.[$t].tagged) else . end'; fi
+  if printf '%s' "$base" | jq --arg t "$1" "$filter" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$STATE_FILE" || { rm -f "$tmp"; return 1; }
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+}
 ar_state_del() { # <tab_id>
+  AR_STATE_ROWS_LOADED=""
   local base tmp
   base=$(ar_state_read) || return 1
   tmp=$(mktemp "$STATE_DIR/.state.XXXXXX") || return 1
@@ -237,92 +913,190 @@ ar_state_del() { # <tab_id>
   return 1
 }
 ar_state_prune() { # <keep tab_ids...> - drop entries for tabs that no longer exist
+  # The keep list is joined on newlines, so an id carrying one would split into two
+  # entries that match nothing and the tab would be pruned while it still exists,
+  # reading as hand-renamed on the next pass. Ids reach here through `clean`, which
+  # is what keeps a control character out of one (see AR_JQ_CLEAN).
   local keep base pruned tmp
-  # Seeing no ids is not evidence that all tabs have closed.
+  # No ids means nothing was seen, not that nothing exists: `printf '%s\n'` on
+  # no arguments still emits one empty line, so the keep list would read [""]
+  # and drop every tab record. The callers guard this too. Both lines stand.
   [ "$#" -gt 0 ] || return 0
-  keep=$(printf '%s\n' "$@" | jq -R -s 'split("\n")[:-1]') || return 1
-  base=$(ar_state_read) || return 1
+  keep=$(printf '%s\n' "$@" | jq -R . | jq -s .) || return 0
+  base=$(ar_state_read) || return 0                      # unreadable: leave it alone
+  # "ws:" keys belong to the workspace tracker (ar_state_prune_ws prunes those),
+  # and a keep list of tab ids never holds one: selecting on this list ALONE wiped
+  # every workspace's ownership record on the pass after it was written, so each
+  # workspace read as first-seen, found a label that was no longer herdr's own
+  # derivation, and opted itself out of tracking for good -- issue #13 again, one
+  # layer down. Each kind prunes its own keys and leaves the other's alone.
   pruned=$(printf '%s' "$base" | jq -c --argjson keep "$keep" \
-    'with_entries(select(.key as $k | $keep | index($k)))' 2>/dev/null) || return 1
-  # Avoid rewriting the whole store on every event when no tab has closed.
-  [ "$pruned" != "$base" ] || return 0
-  tmp=$(mktemp "$STATE_DIR/.state.XXXXXX") || return 1
-  if { printf '%s' "$pruned" > "$tmp"; } 2>/dev/null && mv "$tmp" "$STATE_FILE"; then
+    'with_entries(select((.key | startswith("ws:")) or (.key as $k | $keep | index($k))))' \
+    2>/dev/null) || return 0
+  # Write only when something was dropped. This runs on every event, and a pass
+  # that prunes nothing is the steady state, so rewriting the file here made the
+  # write the every-event path rather than the rare one -- and every write is a
+  # turn through the lock's residual race. Both sides are compact JSON
+  # (ar_state_read slurps through `jq -c`), so a byte comparison is exact.
+  [ -n "$pruned" ] && [ "$pruned" != "$base" ] || return 0
+  AR_STATE_ROWS_LOADED=""
+  tmp=$(mktemp "$STATE_DIR/.state.XXXXXX") || return 0
+  if printf '%s' "$pruned" > "$tmp"; then mv "$tmp" "$STATE_FILE"; else rm -f "$tmp"; fi
+}
+
+# ar_state_claim <tab_id> <name> <named 0|1> [ws] [tagged 0|1] - record that we
+# own <tab_id> at <name>, unless nothing has changed. State already saying
+# exactly this is the steady state -- every named tab, on every pass -- and
+# ar_state_set rewrites the whole file, so the guard keeps a quiet session from
+# rewriting it per tab per event. Reads what ar_name_eligible published for this
+# same tab, `tagged` included: without it in the compare, the pass that heals a
+# tagged tab (knob off, tag taken back off) would skip its write as a no-op and
+# leave the row claiming a tag the label no longer carries.
+ar_state_claim() {
+  [ "$3" = "1" ] || return 0
+  local g=''
+  [ "${5:-}" = "1" ] && g=true
+  # Ownership has to be RECORDED, not merely computed, before a reset can say the
+  # tab is back under naming: reporting it any earlier told the user it worked when
+  # the rename failed, or when the state write did, and a tab in either position
+  # opts itself straight back out on the next pass.
+  # The key check is what makes "state already says this" about THIS tab: the
+  # globals describe whichever tab ar_name_eligible examined last, and a claim
+  # for another tab must not skip its write on them.
+  if [ "${AR_STATE_KEY:-}" = "$1" ] && [ "${AR_STATE_ENABLED:-}" = "true" ] \
+     && [ "${AR_STATE_AUTO:-}" = "$2" ] && [ "${AR_STATE_WS:-}" = "${4:-}" ] \
+     && [ "${AR_STATE_TAGGED:-}" = "$g" ]; then
+    :                                    # state already says this; nothing to write
+  elif ! ar_state_set "$1" "$2" true "${4:-}" "$g"; then
+    return 1
+  fi
+  [ -n "${AR_FORCE_TAB:-}" ] && [ "$1" = "$AR_FORCE_TAB" ] && AR_FORCE_ADOPTED=1
+  return 0
+}
+
+# Publish ownership before the synchronous tab.renamed event can observe it.
+# The backup is made before the claim, so a rejected rename can restore the
+# complete record, including migration and host-tag provenance. Caller holds lock.
+ar_rename_owned_tab() { # <tab> <name> <old-label> <new-label> <ws> <tagged> [dirty]
+  local tab=$1 name=$2 label=$3 want=$4 ws=$5 tagged=$6 before backup adopted
+  if [ "$want" = "$label" ] && [ "${7:-false}" != "true" ]; then
+    ar_state_claim "$tab" "$name" 1 "$ws" "$tagged" || return 1
+    ar_trace "$tab label already correct: [$want]"
     return 0
   fi
-  rm -f "$tmp"
+  before=$(ar_state_read) || return 1
+  backup=$(mktemp "$STATE_DIR/.rollback.XXXXXX") || return 1
+  if ! printf '%s' "$before" > "$backup"; then rm -f "$backup"; return 1; fi
+  adopted=${AR_FORCE_ADOPTED:-}
+  if ! ar_state_claim "$tab" "$name" 1 "$ws" "$tagged"; then
+    rm -f "$backup"
+    return 1
+  fi
+  if "$HERDR" tab rename "$tab" "$want" >/dev/null 2>&1; then
+    rm -f "$backup"
+    ar_trace "$tab rename issued: [$label] -> [$want]"
+    return 0
+  fi
+  AR_STATE_ROWS_LOADED=""
+  AR_FORCE_ADOPTED=$adopted
+  mv "$backup" "$STATE_FILE" || { ar_trace "$tab rollback failed: $backup"; return 1; }
+  ar_trace "$tab rename rejected; ownership restored"
   return 1
-}
-
-# ar_rename_owned_tab <tab_id> <auto-name> <current-label> <desired-label>
-# Publish ownership before rename emits tab.renamed, so the event handler can
-# recognize our own update. A rejected rename must restore the previous record;
-# otherwise the old label looks like a manual rename on the next pass.
-ar_rename_owned_tab() {
-  local tab=$1 name=$2 label=$3 want=$4 old_auto old_enabled
-  old_auto=$(ar_state_get "$tab" auto) || return 1
-  old_enabled=$(ar_state_get "$tab" enabled) || return 1
-  ar_state_set "$tab" "$name" true || return 1
-  [ "$want" = "$label" ] && return 0
-  if "$HERDR" tab rename "$tab" "$want" >/dev/null 2>&1; then return 0; fi
-  case "$old_enabled" in
-    true|false) ar_state_set "$tab" "$old_auto" "$old_enabled" ;;
-    *)          ar_state_del "$tab" ;;
-  esac
-  return 1
-}
-
-# ar_tab_rename_is_owned <tab_id> -> true when the tab's current base is the
-# auto-name already recorded in state. Used to ignore tab.renamed events emitted
-# by our own rename calls, which would otherwise immediately reconcile against
-# pane cwd data that can lag the shell hook until focus changes.
-ar_tab_rename_is_owned() {
-  local tab=$1 enabled auto raw label base
-  [ -n "$tab" ] || return 1
-  enabled=$(ar_state_get "$tab" enabled)
-  [ "$enabled" = "true" ] || return 1
-  auto=$(ar_state_get "$tab" auto)
-  raw=$("$HERDR" tab get "$tab" 2>/dev/null) || return 1
-  [ -n "$raw" ] || return 1
-  printf '%s' "$raw" | jq -e '(.result.tab // .tab) | has("label")' >/dev/null 2>&1 || return 1
-  label=$(printf '%s' "$raw" | jq -r '(.result.tab // .tab).label // ""' 2>/dev/null)
-  base=$(ar_strip_prefix "$label")
-  [ "$base" = "$auto" ] && return 0
-  [ -z "$auto" ] && ar_is_placeholder "$base"
 }
 
 # ar_name_eligible <tab_id> <base label, prefix already stripped>
 # The manual-rename exclusion state machine. Returns 0 (eligible for auto-naming)
 # or 1 (leave the base alone). May write opt-out state as a side effect. Needs no
 # computed name, so an opted-out tab costs no process-info call.
+#
+# The fields it reads are published as AR_STATE_ENABLED / AR_STATE_AUTO /
+# AR_STATE_WS / AR_STATE_TAGGED for the tab just examined, so a caller about to
+# record ownership can tell an unchanged claim (the steady state, every pass,
+# for every named tab) from one worth writing -- ar_state_set rewrites the whole
+# state file. The shell hook reads AR_STATE_WS for the dedupe as well.
 ar_name_eligible() {
-  local tab=$1 slabel=$2 enabled auto
-  enabled=$(ar_state_get "$tab" enabled) || return 1
-  auto=$(ar_state_get "$tab" auto) || return 1
+  local tab=$1 slabel=$2 enabled auto ws seeded tagged
+  ar_state_rows
+  # A store the pass could not read says nothing about this tab, and writing an
+  # opt-out against nothing is how a record gets lost. Leave the tab as it is.
+  [ -z "${AR_STATE_ROWS_BAD:-}" ] || { ar_trace "$tab state unreadable: left alone"; return 1; }
+  IFS=$AR_ROW_SEP read -r enabled auto ws seeded tagged <<< "$(ar_state_fields "$tab")"
+  # A seeded record is ar_state_seed's guess that this tab is one the shared
+  # store already owned, and the label is the only thing that can confirm it.
+  # Where it does not, the guess was about another session's tab of the same id
+  # -- every server numbers from w1:t1 -- so the record is dropped and the tab
+  # is examined as the unseen one it is. Reading the mismatch as a hand rename
+  # instead opted out the first tab of every session created after the upgrade.
+  #
+  # An empty label is excluded because the machine below already re-adopts on
+  # one, whatever the record says, so there is nothing a drop would change.
+  if [ "$seeded" = "true" ] && [ "$enabled" = "true" ] \
+     && [ -n "$slabel" ] && [ "$slabel" != "$auto" ]; then
+    ar_state_del "$tab" || return 1
+    ar_trace "$tab seeded dropped: label [$slabel] is not the seeded [$auto]"
+    enabled="" auto="" ws="" tagged=""
+  fi
+  # The key goes with the fields so ar_state_claim can tell they describe the
+  # tab it is about to claim, rather than whichever tab was examined last.
+  # `tagged` rides along as "" / "true" so the claim's guard compares it without
+  # a spelling change of its own.
+  AR_STATE_KEY=$tab
+  AR_STATE_ENABLED=$enabled
+  AR_STATE_AUTO=$auto
+  AR_STATE_WS=$ws
+  AR_STATE_TAGGED=$tagged
   if [ -n "${AR_FORCE_TAB:-}" ] && [ "$tab" = "$AR_FORCE_TAB" ]; then
+    ar_trace "$tab forced by reset"
     return 0                                    # reset forces re-adoption
   elif [ -z "$enabled" ]; then
     # First time we see this tab: adopt herdr's generated placeholder label
     # (empty or a bare integer); anything else was named by hand -> opt out.
-    if ar_is_placeholder "$slabel"; then return 0
-    else ar_state_set "$tab" "" false; return 1
+    if ar_is_placeholder "$slabel"; then ar_trace "$tab first-seen placeholder adopt"; return 0
+    else ar_trace "$tab first-seen named opt-out: label [$slabel]"; ar_state_set "$tab" "" false; return 1
     fi
   elif [ "$enabled" = "false" ]; then
     # Opted out. Re-adopt ONLY on an explicit clear (empty label); a numeric
     # label is a deliberate name, not a reset (use the reset action for that).
-    if [ -z "$slabel" ]; then return 0
-    else return 1
+    if [ -z "$slabel" ]; then ar_trace "$tab opt-out lifted: label cleared, re-adopt"; return 0
+    else ar_trace "$tab opt-out stands: label [$slabel] is the user's"; return 1
     fi
   else
     # We own it; keep updating while the base still matches what we last set.
-    if [ "$slabel" = "$auto" ]; then return 0
-    elif [ -z "$slabel" ]; then return 0        # user cleared it -> re-adopt
+    if [ "$slabel" = "$auto" ]; then
+      # The label has confirmed a seeded claim, so the record is ours outright
+      # from here and the mark goes. Nothing else would clear it: ar_state_claim
+      # skips its write whenever state already says what the pass computed,
+      # which is the steady state for every named tab, so the mark would outlive
+      # the migration it describes -- and it changes what a later hand rename
+      # means. A numeric label is deliberate against an owned record and opts
+      # out, where a marked one is dropped and re-examined, and the first-seen
+      # path reads that number as herdr's own placeholder and takes the tab
+      # back. One write, on the one pass that confirms it.
+      # Published only when the write landed. Publishing it regardless told
+      # ar_state_claim that state already said this, so it skipped its own
+      # write too, and the mark stayed on disk with nothing left to retry it.
+      if [ "$seeded" = "true" ]; then
+        ar_state_set "$tab" "$auto" true "$ws" "$tagged" || return 1
+        AR_STATE_ENABLED=true
+      fi
+      ar_trace "$tab owned unchanged: label [$slabel] is ours"
+      return 0
+    elif [ -z "$slabel" ]; then ar_trace "$tab owned, label cleared, re-adopt"; return 0
     # A HIDE_SHELL tab is owned with an EMPTY auto name, and herdr may hand a
     # label-less tab its generated number back (a restored session, its own
     # relabeling). Reading that as a hand rename would freeze the tab on the
     # number and stop naming it once a real program starts, so keep ownership.
-    elif [ -z "$auto" ] && ar_is_placeholder "$slabel"; then return 0
-    else ar_state_set "$tab" "" false; return 1 # user renamed -> opt out
+    elif [ -z "$auto" ] && ar_is_placeholder "$slabel"; then ar_trace "$tab owned hidden tab, placeholder [$slabel] kept"; return 0
+    # A separator edited mid-session leaves our own tag on the label in a
+    # spelling no peel can take off, and reading that as a hand rename opted
+    # the tab out and let the pass stack a fresh tag onto the old one. The
+    # row's `tagged` is the receipt that a tag was written at all; with the
+    # head reading as this machine's name and the tail as the exact base the
+    # store remembers, the label is ours to rewrite on the current spelling.
+    elif [ "$tagged" = "true" ] && [ -n "$auto" ] && ar_tag_residue_p "$slabel" "$auto"; then
+      ar_trace "$tab owned, tag spelled under a separator we no longer hold: [$slabel] ends in [$auto]"
+      return 0
+    else ar_trace "$tab owned user-renamed opt-out: label [$slabel] is not [$auto]"; ar_state_set "$tab" "" false; return 1 # user renamed -> opt out
     fi
   fi
 }
@@ -331,28 +1105,99 @@ ar_name_eligible() {
 # tab-name computation (herdr-touching; feeds ar_format from naming.sh)
 # ======================================================================
 
-# ar_resolve_pane <tab_id> <pane_count> <focused> -> TSV "pane_id<TAB>cwd".
-# The sole pane of a single-pane tab, else the globally focused pane for the
-# focused tab. A background multi-pane tab exposes no active pane over the socket
-# and returns empty fields (its name is left as-is until it is next focused).
-# Reads pane identity and foreground cwd from the cached $AR_PANES_JSON so name
-# computation never needs another herdr request.
+# ar_resolve_pane <tab_id> <pane_count> <focused> <layout_pane> -> the active
+# pane_id, or "" when this tab has none to name from.
+#
+# <layout_pane> is the pane the snapshot reshape in ar_reconcile picked for this
+# tab and carried on its row (which is why this costs no herdr call and no jq of
+# its own): the tab's own focused pane, or the agent at work in it. herdr
+# publishes one layout per tab, so it answers for every tab, and it is why a
+# background multi-pane tab can be named at all.
+#
+# Everything below is the fallback for a herdr whose snapshot carries no layouts
+# and for the per-list path, which has none: the sole pane of a single-pane tab,
+# else the tab's OWN focused pane, else "". Nothing here reads the session-wide
+# focus, and a multi-pane tab with no focused pane of its own gets no answer
+# rather than an arbitrary one -- pane focus follows whichever client moved it
+# last, so a focused tab whose panes all read unfocused is what a second client
+# or a remote attach looks like, and its first pane is a guess. Reads the cached
+# $AR_PANES_JSON.
 ar_resolve_pane() {
-  local tid=$1 pc=$2 foc=$3
+  local tid=$1 pc=$2 foc=$3 lp=${4:-}
+  if [ -n "$lp" ]; then
+    printf '%s' "$lp"
+    return 0
+  fi
   printf '%s' "$AR_PANES_JSON" | jq -r --arg t "$tid" --arg pc "$pc" --arg foc "$foc" '
     (.result.panes // .panes // []) as $p
     | ($p | map(select(.tab_id == $t))) as $tp
     | (if $pc == "1" then $tp[0]
-       elif $foc == "true" then (($p | map(select(.focused)) | .[0]) // $tp[0])
+       elif $foc == "true" then ($tp | map(select(.focused)) | .[0])
        else null end)
-    | if . == null then ["", ""]
-      else [(.pane_id // ""), (.foreground_cwd // .cwd // "")]
-      end
-    | @tsv
+    | if . == null then "" else (.pane_id // "") end
   ' 2>/dev/null
 }
 
-# ar_pane_program <pane_id> -> TSV "program<TAB>cmdline".
+# ar_pane_facts <pane_id> -> sets AR_PANE_AGENT / AR_PANE_TITLE /
+# AR_PANE_TITLE_LC / AR_PANE_DIR_LC from the cached pane list. herdr publishes all
+# of it on the pane object itself, so this needs no herdr call on any version.
+#
+# On the snapshot path those values arrive already lifted, on the tab row (see the
+# reshape in ar_reconcile), and this runs only where that path is unavailable.
+# Reading the whole pane list back per tab is what it costs, which is why the
+# snapshot path does not.
+#
+# AR_PANE_AGENT is herdr's own detection result (.agent). The panes carrying it
+# are exactly the ones `agent list` reports (verified against a live herdr 0.8.0).
+# The neighboring .agent_session is deliberately NOT consulted: it is a resume
+# reference, and a pane can carry one while detection reports nothing (herdr#803's
+# half-wired state), so naming from it would bypass the detection gate on a stale
+# ref.
+#
+# AR_PANE_TITLE is what the program running there set as the terminal title. For a
+# coding agent that is a description of the work in progress, which is the whole
+# of AGENT_TITLES. herdr keeps an ANSI-stripped copy, and _stripped means exactly
+# that -- a spinner glyph is still on the front of it (see ar_title_clean).
+#
+# AR_PANE_DIR is the directory the pane is in: the context half of the label is
+# named after it (ar_context_dir), and AR_PANE_DIR_LC -- its basename, folded --
+# is what recognizes a title that is just that directory repeated back.
+ar_pane_facts() {
+  local out
+  AR_PANE_AGENT=""; AR_PANE_TITLE=""; AR_PANE_TITLE_LC=""; AR_PANE_DIR_LC=""; AR_PANE_DIR=""
+  AR_PANE_SESSION=""
+  out=$(printf '%s' "$AR_PANES_JSON" | jq -r --arg p "$1" \
+    --arg brands "${AR_TITLE_BRANDS:-}" "$AR_JQ_CLEAN$AR_JQ_TASK"'
+    ($brands | brandmap) as $brand
+    | (.result.panes // .panes // []) | map(select(.pane_id == $p)) | .[0] as $pane
+    # ascii_downcase folds ASCII only, so a title and a directory that differ just
+    # by the case of a non-ASCII letter are not seen as equal. Deliberate: the
+    # refusals it feeds are about product names and directory names, and a
+    # Unicode-aware compare would have to move back into jq per tab.
+    | ($pane.terminal_title_stripped // $pane.terminal_title
+       | taskof($brand; $pane.agent)) as $t
+    | (($pane.foreground_cwd // $pane.cwd) | clean) as $dir
+    | [ ($pane.agent | clean), $t, ($t | ascii_downcase),
+        (($dir | split("/") | last) // "" | ascii_downcase), $dir,
+        ($pane.agent_session.value | clean) ]
+    | join([31] | implode)' 2>/dev/null)
+  IFS=$AR_ROW_SEP read -r AR_PANE_AGENT AR_PANE_TITLE AR_PANE_TITLE_LC AR_PANE_DIR_LC \
+    AR_PANE_DIR AR_PANE_SESSION <<< "$out"
+}
+
+# ar_split_program <ar_pane_program output> -> sets AR_PROG / AR_CMD.
+# Two lines in, two globals out: `read` would do it, but it reports the missing
+# second line (an empty command line, which command substitution has already
+# trimmed away) as a failure, and this runs inside an && chain.
+ar_split_program() {
+  AR_PROG=${1%%$'\n'*}
+  case $1 in
+  *$'\n'*) AR_CMD=${1#*$'\n'} ;;
+  *) AR_CMD="" ;;
+  esac
+}
+
+# ar_pane_program <pane_id> -> "program" and "cmdline", one per line.
 # The foreground command is the process-group leader (pid == group id). At a bare
 # prompt the leader IS the login shell, whose argv0 ("-zsh") strips to "zsh".
 #
@@ -367,38 +1212,173 @@ ar_resolve_pane() {
 ar_pane_program() {
   local out
   out=$("$HERDR" pane process-info --pane "$1" 2>/dev/null) || return 1
-  printf '%s' "$out" | jq -r '
+  # Each value on its own LINE, which is only safe because clean has taken the
+  # newlines out (see AR_JQ_CLEAN).
+  printf '%s' "$out" | jq -r "$AR_JQ_CLEAN"'
     (.result.process_info // .process_info) as $pi
     | ($pi.foreground_process_group_id) as $g
     | ($pi.foreground_processes // []) as $fp
-    | ($fp | map(select(.pid == $g)) | first) as $p
+    # Where herdr names NO foreground group (some Linux container and sandbox
+    # setups: it cannot read one, so this field is null) it can still report the
+    # processes in the pane, and a list of exactly ONE is not ambiguous: there is
+    # nothing to choose between, so naming the tab after it is not a guess and
+    # beats leaving naming dead on those hosts.
+    #
+    # Two or more with no named group IS a guess, and this plugin does not make
+    # it. herdr documents its own degraded detection as one where a background job
+    # can look like the foreground one, and it does not order this list (a live
+    # 0.8.0 lists a `caffeinate` child ahead of the `claude` leader it belongs
+    # to), so a pick here could name the tab after something nobody is running --
+    # and the reconcile would then own that name until the process set changed.
+    #
+    # A named group whose process is absent from the list is also a no-answer:
+    # that is a group racing its own exit, where the name the tab already has is
+    # the better answer. So is an EMPTY list, which yields ["", ""] as before.
+    | (if $g == null then (if ($fp | length) == 1 then $fp[0] else null end)
+       else ($fp | map(select(.pid == $g)) | first) end) as $p
     | if ($p == null) then
-        ["", ""]
+        "", ""
       else
-        [ (($p.argv0 // (($p.argv // [])[0]) // $p.name // "") | sub("^-"; "") | split("/") | last),
-          ($p.cmdline // (($p.argv // []) | join(" "))) ]
+        (($p.argv0 // (($p.argv // [])[0]) // $p.name // "") | clean | sub("^-"; "") | split("/") | last),
+        (($p.cmdline // (($p.argv // []) | join(" "))) | clean)
       end
-    | @tsv
   ' 2>/dev/null
 }
 
-# ar_tab_name <tab_id> <pane_count> <focused> -> computed base name on stdout.
+# ar_branch_of <directory> -> what the branch checked out there contributes to a
+# label, or "" -- from the repository when there is one, and nothing when there
+# is not. Published as AR_BRANCH as well as printed, so a caller on the naming
+# path can read it back without a command substitution: the read itself is a
+# handful of opens and no fork (see git.sh), and the fork would have been the
+# expensive half.
+ar_branch_of() {
+  AR_BRANCH=""
+  ar_branch_wanted || return 0
+  ar_git_head "$1" || return 0
+  AR_BRANCH=$(ar_branch_label "$AR_GIT_HEAD" "$AR_GIT_DEFAULT")
+  printf '%s' "$AR_BRANCH"
+}
+
+# ar_tab_name <tab_id> <pane_count> <focused> <layout_pane> [workspace base]
+#   -> base name on stdout.
 # Returns 1 when the name can't be computed (no resolvable pane, process-info
 # failure); a successful HIDE_SHELL computation returns 0 with EMPTY output, so
 # the caller must read the status, not the string, to tell the two apart.
 ar_tab_name() {
-  local pane_data pane="" cwd="" info prog="" cmd=""
-  pane_data=$(ar_resolve_pane "$1" "$2" "$3")
-  IFS=$'\t' read -r pane cwd <<< "$pane_data"
-  [ -n "$pane" ] || return 1
+  local pane info prog="" cmd="" title="" condensed=""
+  pane=$(ar_resolve_pane "$1" "$2" "$3" "${4:-}")
+  [ -n "$pane" ] || { ar_trace "$1 no pane resolved to name from"; return 1; }
+  # The caller may already hold this pane's facts, lifted onto the tab row -- but
+  # only for the pane the reshape PICKED, which is <layout_pane>. Where that came
+  # back empty (a snapshot carrying no layouts, or no layout for this tab) the pane
+  # above was resolved from the pane list instead, and its facts are still unread:
+  # trusting the row there cost the tab its title AND the wrapper unwrap, so a
+  # node-fronted codex read "node" again.
+  if [ -z "${4:-}" ] || [ "$pane" != "$4" ]; then
+    ar_trace "$1 pane $pane resolved from the pane list"
+    ar_pane_facts "$pane"
+  else
+    ar_trace "$1 pane $pane picked by the snapshot reshape"
+  fi
+  # An agent tab is named after the work the agent reports, when it reports any:
+  # five claude tabs all read "claude" otherwise, which is the one thing naming
+  # them by program cannot fix. This answer also needs no process lookup, so an
+  # agent-heavy session spends fewer herdr round-trips than it did before (the
+  # local work is a wash: one jq over the pane row instead of one over the
+  # process-info reply).
+  if [ "${AGENT_TITLES:-1}" = "1" ] && [ -n "$AR_PANE_AGENT" ]; then
+    title=$(ar_title_clean "$AR_PANE_TITLE" "$AR_PANE_TITLE_LC" "$AR_PANE_DIR_LC" "$AR_PANE_AGENT")
+    [ -n "$title" ] || ar_trace "$1 title refused or absent: [$AR_PANE_TITLE]"
+    # The agent has not titled its terminal, or titled it with something that
+    # says nothing. Claude Code derives that title from what the user typed, so a
+    # session opened with a slash command and answered by the agent alone never
+    # gets one -- and its own transcript is where it says what it is doing. Only
+    # reached when there is a session to read and a title that was not enough, so
+    # a titled agent pays nothing for this.
+    if [ -z "$title" ] && [ -n "$AR_PANE_SESSION" ] \
+       && ar_transcript_topic "$AR_PANE_AGENT" "$AR_PANE_SESSION" "$AR_PANE_DIR"; then
+      title=$(ar_title_clean "$AR_TRANSCRIPT_TOPIC" "$AR_TRANSCRIPT_TOPIC_LC" \
+        "$AR_PANE_DIR_LC" "$AR_PANE_AGENT")
+      [ -n "$title" ] && ar_trace "$1 transcript topic used: [$title]"
+    fi
+    if [ -n "$title" ]; then
+      ar_trace "$1 title accepted: [$title]"
+      # What survived is prose, and ar_format truncates it to fit the budget, so
+      # the words that say WHICH task this is are the ones it drops. Condensing
+      # first spends that budget on nouns instead. It selects, never generates:
+      # a title it cannot shorten comes back empty and the sentence is kept.
+      # Both title sources land here, so a topic read out of a transcript is
+      # condensed the same way the terminal title is.
+      #
+      # The glyph and the space behind it are prepended BEFORE that truncation
+      # and come out of the same budget, so they are reserved here; without that
+      # the tail of a full-length label is what gets cut.
+      #
+      # The real glyph, not an allowance for one. ar_condense_title measures what
+      # it is handed, in codepoints, so the reserve has to BE the text that will
+      # share the label: a two-character guess is right only for the one-glyph
+      # case, and wrong in both directions elsewhere. An ICON_MAP entry may be
+      # any string, and its extra characters would cut a word in half at the end
+      # -- the one thing condensing exists to prevent. A program with no glyph
+      # reserves nothing, rather than shortening the label to make room for
+      # something that never arrives. ar_icon is a lookup, no subshell.
+      if [ "${TITLE_CONDENSE:-0}" = "1" ]; then
+        local reserve="" style=${ICON_STYLE:-name_and_icon}
+        if [ "${ICONS_ENABLED:-0}" = "1" ] && [ "$style" != "name" ]; then
+          reserve=$(ar_icon "$AR_PANE_AGENT")
+          # ar_format drops a lone fallback glyph under ICON_STYLE=icon, so no
+          # room is kept for one it will not draw.
+          [ "$style" = "icon" ] && [ "$reserve" = "${ICON_FALLBACK:-}" ] && reserve=""
+          [ -n "$reserve" ] && reserve="$reserve "
+        fi
+        # The reserve is unconditional, and one case underfills because of it:
+        # ar_format draws no glyph on a label reading as the shell's own name,
+        # so "Fix zsh integration" reserves two characters and then spends
+        # neither, coming out "zsh" where "zsh-integration" would have fitted.
+        # Mirroring that suppression here is not available -- it tests the
+        # OUTPUT, so condensing again without the reserve returns
+        # "zsh-integration", which is no longer the shell's name, which brings
+        # the glyph back, which no longer fits: "<glyph> zsh-integratio". The
+        # underfilled label is stable and the alternative oscillates, so the
+        # reserve stays.
+        # The name prefix is charged here too. ar_format prepends it AFTER this,
+        # out of this same budget, so a label condensed to fill the budget was
+        # then prefixed and cut -- and being fused with separators it has no
+        # space for the word-boundary trim to fall back on, so the cut landed
+        # mid-keyword, which is the one thing condensing exists to prevent.
+        # ar_title_name_prefix is the same answer ar_format will act on, asked
+        # once rather than derived twice.
+        reserve="$reserve$(ar_title_name_prefix "$AR_PANE_AGENT" "${MAX_TITLE_LEN:-28}")"
+        condensed=$(ar_condense_title "$title" "$reserve")
+        [ -n "$condensed" ] && title=$condensed
+      fi
+      ar_branch_of "$AR_PANE_DIR" >/dev/null
+      ar_label "$AR_PANE_DIR" "${5:-}" "$AR_BRANCH" "$AR_PANE_AGENT" "" "$title"
+      return 0
+    fi
+  fi
   # process-info can fail transiently (pane closing, socket hiccup) or resolve no
   # foreground process; both leave prog empty. Fail so the caller keeps the tab's
   # current name, rather than falling through to ar_format "" "" -> $SHELL_NAME
   # and clobbering (e.g.) an "nvim" tab with "zsh" on a blip.
-  info=$(ar_pane_program "$pane") || return 1
-  IFS=$'\t' read -r prog cmd <<< "$info"
-  [ -n "$prog" ] || return 1
-  ar_format "$prog" "$cmd" "$cwd"
+  info=$(ar_pane_program "$pane") || { ar_trace "$1 process-info failed for pane $pane"; return 1; }
+  ar_split_program "$info"
+  prog=$AR_PROG
+  cmd=$AR_CMD
+  [ -n "$prog" ] || { ar_trace "$1 no foreground program in pane $pane"; return 1; }
+  # An agent installed through npm or npx fronts as its runtime, so the tab would
+  # be named "node" for a pane herdr knows is running codex. Where the foreground
+  # program is one of those runtimes AND herdr reports an agent for the pane, its
+  # answer wins. Both conditions are needed: a plain `node server.js` tab has no
+  # agent and keeps its name, and an agent that reports its own name never
+  # reaches this.
+  if ar_in_list "$prog" "${WRAPPER_PROGRAMS[@]}" && [ -n "$AR_PANE_AGENT" ]; then
+    prog=$AR_PANE_AGENT
+    cmd=$AR_PANE_AGENT
+  fi
+  ar_trace "$1 program path used: $prog"
+  ar_branch_of "$AR_PANE_DIR" >/dev/null
+  ar_label "$AR_PANE_DIR" "${5:-}" "$AR_BRANCH" "$prog" "$cmd"
 }
 
 # ======================================================================
@@ -413,24 +1393,105 @@ ar_tab_name() {
 # from the herdr-invoked pass and the shell hooks alike. Falls back to the default
 # session's dir when the variable is unset.
 ar_herdr_session_dir() {
+  local session dir
   if [ -n "${HERDR_SOCKET_PATH:-}" ]; then
-    printf '%s' "${HERDR_SOCKET_PATH%/*}"
+    case "$HERDR_SOCKET_PATH" in
+      */*) dir=${HERDR_SOCKET_PATH%/*}; printf '%s' "${dir:-/}" ;;
+      *) printf '.' ;;
+    esac
   else
+    session=$(ar_session_name)
     printf '%s/herdr' "${XDG_CONFIG_HOME:-$HOME/.config}"
+    [ -z "$session" ] || printf '/sessions/%s' "$session"
   fi
+  return 0
+}
+
+# ar_fnv1a64 <string> -> its FNV-1a 64 hash, as 16 lowercase hex digits.
+#
+# herdr names each client's preference file after this hash of the client socket
+# path (path_for_local_endpoint, src/client/shell/preferences.rs), so reading the
+# file means reproducing the hash. Bash arithmetic is 64-bit and wraps on
+# overflow, which is exactly the multiply FNV wants, and LC_ALL=C makes
+# ${s:i:1} a byte rather than a character so a path outside ASCII hashes the way
+# Rust's bytes do.
+ar_fnv1a64() {
+  local LC_ALL=C s=$1 i=0 n h=$((0xcbf29ce484222325)) b
+  n=${#s}
+  while [ "$i" -lt "$n" ]; do
+    printf -v b '%d' "'${s:i:1}"
+    h=$(((h ^ (b & 0xff)) * 0x100000001b3))
+    i=$((i + 1))
+  done
+  printf '%016x' "$h"
+}
+
+# ar_herdr_client_prefs -> the file herdr's terminal UI keeps this session's
+# presentation state in.
+#
+# herdr 0.9.0 moved the terminal UI into each client and took that state with it:
+# sidebar collapse and the agent panel's sort order left session.json and
+# config.toml for <state dir>/client-shell/local-<hash>.json, written atomically
+# the moment either changes. The name is the FNV-1a 64 of the CLIENT socket path,
+# which herdr derives from the API socket path by inserting "-client" before the
+# extension (derive_client_socket_from_api_socket, src/server/socket_paths.rs) --
+# so the whole path comes from what herdr already exports to us, in a named
+# session as well as the default one.
+#
+# One file per socket rather than per client: two local clients attached to one
+# session share it and the last writer wins. Nothing here creates the file, and
+# an older herdr writes none, which is what ar_collapsed_spaces reads as "look in
+# session.json instead".
+ar_herdr_client_prefs() {
+  local sock base stem dir csock
+  if [ -z "${HERDR_SOCKET_PATH:-}" ] && [ -n "${HERDR_CLIENT_SOCKET_PATH:-}" ]; then
+    csock=$HERDR_CLIENT_SOCKET_PATH
+  else
+    sock="${HERDR_SOCKET_PATH:-$(ar_herdr_session_dir)/herdr.sock}"
+    base=${sock##*/}
+    # Rust file_stem removes the last extension, but preserves a leading dot.
+    case "$base" in ?*.*) stem=${base%.*} ;; *) stem=$base ;; esac
+    case "$sock" in
+      */*) dir=${sock%/*}; csock="$dir/$stem-client.sock" ;;
+      *) csock="$stem-client.sock" ;;
+    esac
+  fi
+  printf '%s/herdr/client-shell/local-%s.json' \
+    "${XDG_STATE_HOME:-$HOME/.local/state}" "$(ar_fnv1a64 "$csock")"
 }
 
 # ar_collapsed_spaces -> JSON array of the space keys (repo_key strings) whose
-# sidebar group is collapsed right now. herdr exposes collapse NOWHERE in the API
-# (no field on workspace list / api snapshot, no event, protocol 17), and stores
-# it only as session.json's top-level collapsed_space_keys, so we read that file
-# the way ar_agent_sort reads config.toml. See docs/ARCHITECTURE.md for why that
-# leaves the numbers up to herdr's 5-second save debounce behind a collapse. A
-# missing or unreadable file means "nothing collapsed", which is how the plugin
-# behaved before it read this at all.
+# sidebar group is collapsed right now. herdr exposes collapse NOWHERE in its API
+# (no field on `workspace list` or `api snapshot`, no request method, and none of
+# the events a plugin can subscribe to, re-checked against protocol 22), so the
+# answer comes off disk. Which file it comes off depends on the herdr:
+#
+#   * 0.9.0 and up: collapsed_groups in the client's own preference file
+#     (ar_herdr_client_prefs). The server stopped recording collapse entirely --
+#     capture_snapshot writes an empty collapsed_space_keys unconditionally --
+#     so the old read answered "nothing collapsed" for every collapsed space,
+#     which numbered hidden rows and left every row below one off by as many.
+#   * below 0.9.0: session.json's top-level collapsed_space_keys, where the
+#     server kept it. That herdr writes no client file at all, which is what
+#     picks between the two: the file that is there, not a version test.
+#
+# The keys are the same repo_key strings either way (ClientShellWorktree.key is
+# WorktreeInfo.repo_key). Neither file being readable means "nothing collapsed",
+# which is how the plugin behaved before it read this at all.
 ar_collapsed_spaces() {
-  jq -c '[ .collapsed_space_keys[]? | strings ]' \
-    "$(ar_herdr_session_dir)/session.json" 2>/dev/null || printf '[]'
+  local prefs collapsed
+  prefs=$(ar_herdr_client_prefs)
+  if [ -r "$prefs" ]; then
+    collapsed=$(jq -c -s '
+      if length == 1 and (.[0] | type) == "object"
+      then [.[0].collapsed_groups[]? | strings] else error("invalid preferences") end
+    ' "$prefs" 2>/dev/null) && { printf '%s' "$collapsed"; return 0; }
+  fi
+  collapsed=$(jq -c -s '
+    if length == 1 and (.[0] | type) == "object"
+    then [.[0].collapsed_space_keys[]? | strings] else error("invalid session") end
+  ' "$(ar_herdr_session_dir)/session.json" 2>/dev/null) || collapsed='[]'
+  printf '%s' "$collapsed"
 }
 
 # ar_workspace_positions <workspace-list-json> <collapsed-spaces-json>
@@ -459,7 +1520,7 @@ ar_collapsed_spaces() {
 # No herdr calls and no file reads: both inputs are passed in, so this is directly
 # testable (see tests/test_ws_order.sh).
 ar_workspace_positions() {
-  printf '%s' "$1" | jq -r --argjson collapsed "$2" '
+  printf '%s' "$1" | jq -r --argjson collapsed "$2" "$AR_JQ_CLEAN"'
     [ (.result.workspaces // .workspaces // []) | to_entries[]
       | .value + { _i: .key,
                    _k: (.value.worktree.repo_key // ""),
@@ -481,73 +1542,381 @@ ar_workspace_positions() {
                    else $mem[1:][] end )
             end ] ) as $order
     | $rows[] | ._i as $i | ($order | index($i)) as $pos
-    | [ .workspace_id, (.label // ""), (if $pos == null then 0 else $pos + 1 end) ]
-    | @tsv' 2>/dev/null
+    | [ (.workspace_id | clean), (.label | clean),
+        ((if $pos == null then 0 else $pos + 1 end) | tostring) ]
+    | join([31] | implode)' 2>/dev/null
 }
 
-# Workspaces: number them by herdr's visible sidebar order. Arg 1 is a cached
-# `workspace list` JSON.
-ar_renumber_workspaces() {
-  local json=$1 rows wid label pos base want
-  [ -n "$json" ] || return 0
-  rows=$(ar_workspace_positions "$json" "$(ar_collapsed_spaces)")
-  [ -n "$rows" ] || return 0
-  while IFS=$'\t' read -r wid label pos; do
-    [ -n "$wid" ] || continue
-    base=$(ar_strip_prefix "$label")
-    [ -n "$base" ] || continue          # empty label: nothing to number, leave it
-    want=$(ar_desired "$pos" "$base")   # position 0 (hidden) -> bare, like 10+
-    [ "$want" = "$label" ] && continue
-    "$HERDR" workspace rename "$wid" "$want" >/dev/null 2>&1 || true
-  done <<< "$rows"
+# ar_workspace_identities -> one "<workspace_id><SEP><identity_cwd>" row per
+# workspace herdr has an identity directory for, or nothing at all.
+#
+# identity_cwd is herdr's OWN tracked directory for a workspace: it follows the
+# focused pane's cwd. herdr labels the workspace after it -- until the first
+# rename, which freezes the derivation for good while identity_cwd goes on
+# updating (issue #13). Reading the value back is what lets a numbered workspace
+# keep tracking its directory, and a pane cwd out of `pane list` is not a
+# substitute: herdr updates identity_cwd for the FOCUSED pane only, and a pass
+# would have to decide which pane speaks for a split.
+#
+# This one is still session.json's, and still carries both of that file's
+# caveats: herdr publishes the value nowhere in its API (no field on `workspace
+# list` or `api snapshot`, re-checked against protocol 22), and the file is saved
+# on a 5-second debounce, so a cd lands on the label an event or two later rather
+# than instantly. A missing, unreadable, or older-herdr file yields no rows,
+# which is what makes the caller fall back to the label it wrote last pass -- the
+# behavior before this existed.
+ar_workspace_identities() {
+  jq -r "$AR_JQ_CLEAN"'
+    .workspaces[]? | select(type == "object")
+    | ((.id // .workspace_id) | strings | clean) as $w
+    | (.identity_cwd | strings | clean) as $c
+    | select($w != "" and $c != "")
+    | [ $w, $c ] | join([31] | implode)' \
+    "$(ar_herdr_session_dir)/session.json" 2>/dev/null || printf ''
 }
 
-# ar_clear_tab_number_tokens [tab_id]
-# Remove this plugin's tab-number token from panes that currently carry it.
-# With a tab id, limit the clear to panes in that tab; without one, clear every
-# cached pane. Other custom metadata sources and tokens are left untouched.
-ar_clear_tab_number_tokens() {
-  local tid="${1:-}" rows pid
-  rows=$(printf '%s' "$AR_PANES_JSON" | jq -r \
-    --arg t "$tid" --arg token "$AR_TAB_NUMBER_TOKEN" '
-      (.result.panes // .panes // [])[]
-      | select($t == "" or .tab_id == $t)
-      | select((.tokens // {}) | has($token))
-      | .pane_id // empty
-    ' 2>/dev/null)
-  [ -n "$rows" ] || return 0
-  while IFS= read -r pid; do
-    [ -n "$pid" ] || continue
-    "$HERDR" pane report-metadata "$pid" \
-      --source "$AR_METADATA_SOURCE" \
-      --clear-token "$AR_TAB_NUMBER_TOKEN" >/dev/null 2>&1 || true
-  done <<< "$rows"
+# ar_project_base <dir> -> the base herdr labels a workspace sitting in <dir>:
+# the name of the repository <dir> belongs to, or <dir>'s own name outside a repo.
+# Walks for `.git` as git.sh's ar_git_dir does, and stays separate from it for
+# the reason given there: this answers what a directory is CALLED, so any `.git`
+# ends the walk and none of them is opened.
+#
+# Measured against herdr 0.8.2, both arms. A workspace whose pane cds from a repo
+# root into a subdirectory keeps the repo's name; one that cds between plain
+# directories takes the new directory's name. Taking the basename alone would
+# rename the workspace on every cd inside the project, which is the opposite of
+# what this feature is for.
+#
+# The walk looks for `.git` rather than asking git, because a linked worktree's
+# `.git` is a FILE and its repo name is the checkout's own directory name (herdr
+# labels those by the checkout, not the main repo), which is exactly what the
+# first hit up the chain gives -- and it costs no process. It stops at "/" and
+# tolerates a relative or empty path by answering the plain basename.
+ar_project_base() {
+  local dir=$1
+  case "$dir" in
+    /*) while [ -n "$dir" ] && [ "$dir" != "/" ]; do
+          if [ -e "$dir/.git" ]; then break; fi
+          dir=${dir%/*}
+        done
+        [ -n "$dir" ] && [ "$dir" != "/" ] || dir=$1 ;;
+  esac
+  dir=${dir%/}
+  dir=${dir##*/}
+  # The reconcile hands this a directory that came through jq's clean; the shell
+  # hook hands it a raw $PWD, and a directory may be named anything a filesystem
+  # accepts. A control character in the label is the visible half; the invisible
+  # half is herdr handing the label back normalized, which reads as a name
+  # somebody typed and opts the workspace out of tracking for good. Guarded, so a
+  # clean name pays no fork.
+  case $dir in
+  *[[:cntrl:]]* | *"  "*) dir=$(printf '%s' "$dir" | tr -s '[:cntrl:] ' ' ')
+                          dir=${dir# }; dir=${dir% } ;;
+  esac
+  printf '%s' "$dir"
 }
 
-# ar_sync_tab_number_token <tab_id> <position>
-# Publish a plain 1-9 tab position to every pane in the tab, skipping panes whose
-# cached token is already correct. Positions past 9 have no jump key, so clear a
-# stale value instead of reporting an unreachable number.
-ar_sync_tab_number_token() {
-  local tid=$1 pos=$2 rows pid
-  if [ "$pos" -lt 1 ] || [ "$pos" -gt 9 ]; then
-    ar_clear_tab_number_tokens "$tid"
+# ar_workspace_pane_dirs <workspace-list-json> -> one "<workspace_id><SEP><dir>"
+# row per workspace, from the panes the pass already holds: its focused pane, or
+# a pane of the tab it has active, or any pane of it.
+#
+# This is what covers a workspace herdr has not persisted yet. session.json is
+# saved on a 5-second debounce, and a workspace created inside that window is in
+# no copy of the file, so the pass numbering it seconds after it opened has no
+# identity to compare its label against. Every new workspace passes through that
+# state, and treating it as "a label nobody derived" opted the workspace out of
+# tracking for good: the numbering rename lands first, and by the time herdr
+# writes the file the label it wrote is already the stale one. Reading the pane's
+# directory instead settles the comparison at creation, where the two agree.
+#
+# A pane list is not a substitute for identity_cwd in the steady state, though.
+# herdr moves identity_cwd with the workspace's ACTIVE pane, and which pane that
+# is takes the layout to answer (ar_resolve_pane, the same problem tab naming
+# has), so a workspace whose split panes sit in different directories is exactly
+# where a guess disagrees with herdr's own label.
+ar_workspace_pane_dirs() {
+  local wsjson=$1
+  [ -n "${AR_PANES_JSON:-}" ] || return 0
+  jq -r -n "$AR_JQ_CLEAN"'
+    ($pn.result.panes // $pn.panes // []) as $panes
+    | ($ws.result.workspaces // $ws.workspaces // [])[]
+    | (.workspace_id | clean) as $w
+    | (.active_tab_id | clean) as $at
+    | [ $panes[] | select((.workspace_id | clean) == $w) ] as $mine
+    | [ $mine[] | select(.focused == true) ] as $foc
+    | [ $mine[] | select((.tab_id | clean) == $at) ] as $act
+    | ( ($foc | .[0]) // ($act | .[0]) // ($mine | .[0]) ) as $p
+    | select($p != null)
+    | ((($p.foreground_cwd // $p.cwd) | clean)) as $c
+    | select($c != "")
+    | ( if ($foc | length) > 0 then "1"
+        elif ($act | length) == 1 then "1"
+        elif ($mine | length) == 1 then "1"
+        else "0" end ) as $sure
+    | [ $w, $c, $sure ] | join([31] | implode)' \
+    --argjson ws "$wsjson" --argjson pn "$AR_PANES_JSON" 2>/dev/null || printf ''
+}
+
+# ar_identity_base <workspace_id> -> the base herdr derives for it. Reads the
+# rows ar_workspace_identities put in AR_WS_IDENTITY first, since that is herdr's
+# own answer, and falls back to the pane directory in AR_WS_PANEDIR for a
+# workspace too new to be in the file. Returns 1 when neither knows it, which is
+# not the same answer as an empty base: no row means nothing is known.
+# A loop rather than a jq per row, because a pass sees every workspace and each
+# map is one read.
+# ar_panedir_base <workspace_id> -> the base its own panes give, or empty. The
+# pane rows alone, where ar_identity_base prefers herdr's file and falls back to
+# them, because the debounce rule below has to be able to tell the two apart.
+#
+# Only a row whose pane was not a guess answers here. A background workspace
+# whose active tab is split has no focused pane to read, and the row then names
+# whichever pane came first: letting that override herdr's own identity would
+# not be a stale file corrected, it would be an arbitrary pane preferred over
+# the real one for as long as the two disagreed, which is the one thing the
+# identity rule exists to prevent. The stand-in stays available to
+# ar_identity_base, where a guess beats knowing nothing at all.
+ar_panedir_base() {
+  local wid=$1 k v sure
+  [ -n "${AR_WS_PANEDIR:-}" ] || return 0
+  while IFS=$AR_ROW_SEP read -r k v sure; do
+    if [ "$k" = "$wid" ]; then
+      [ "$sure" = "1" ] || return 0
+      ar_project_base "$v"
+      return 0
+    fi
+  done <<< "$AR_WS_PANEDIR"
+}
+
+ar_identity_base() { # <workspace_id>
+  # A pane row carries a third field saying whether the pane it names was known
+  # rather than guessed (see ar_panedir_base), which is nothing to this function:
+  # naming it keeps it out of the directory, since bash hands the last variable
+  # the rest of the line.
+  # shellcheck disable=SC2034  # `sure` is named so it can be discarded
+  local wid=$1 k v sure rows
+  for rows in "${AR_WS_IDENTITY:-}" "${AR_WS_PANEDIR:-}"; do
+    [ -n "$rows" ] || continue
+    while IFS=$AR_ROW_SEP read -r k v sure; do
+      if [ "$k" = "$wid" ]; then ar_project_base "$v"; return 0; fi
+    done <<< "$rows"
+  done
+  return 1
+}
+
+# ar_ws_track_eligible <workspace_id> <base label, prefix stripped> <identity base>
+# The manual-rename exclusion for workspaces: 0 to take the base from herdr's
+# directory derivation, 1 to leave the label's own base alone. Keyed "ws:<id>" in
+# the same state file the tabs use, which no tab id can collide with (a tab id
+# carries its workspace and a colon) and no tab prune may drop.
+#
+# Two ways in. The label already IS herdr's derivation, which covers a workspace
+# seen for the first time and one renamed back by hand -- the recovery path, since
+# workspaces have no `reset` action. Or state says we own it and the base is still
+# what we last wrote, which is the case that survives a cd: herdr's derivation has
+# moved on and ours has not, and only the record tells that apart from a name
+# somebody typed. Anything else is somebody's name and is left alone for good.
+ar_ws_track_eligible() {
+  local key="ws:$1" slabel=$2 ibase=$3 pbase=${4:-} enabled auto unused seeded
+  # Every field gets a name, including the one a workspace record never carries:
+  # bash hands the LAST variable the rest of the line, delimiters and all, so a
+  # reader short of one name would append the next field to $auto the day a
+  # workspace record grows one -- and the compare below could then never be true
+  # again, which is this workspace opting itself out of directory tracking.
+  ar_state_rows
+  [ -z "${AR_STATE_ROWS_BAD:-}" ] || return 1     # store unreadable: leave the workspace alone
+  # shellcheck disable=SC2034  # `unused` is named so it can be discarded
+  IFS=$AR_ROW_SEP read -r enabled auto unused seeded <<< "$(ar_state_fields "$key")"
+  # A seeded record is dropped where the label confirms neither derivation, for
+  # the reason ar_name_eligible drops one: "ws:w1" collides across sessions the
+  # same way "w1:t1" does. The first branch below covers most of it already, a
+  # new session's workspace usually carrying herdr's own derivation, so this is
+  # the narrower case of one whose derivation has since moved on. Opting out is
+  # permanent here and there is no reset action for a workspace, which is why it
+  # matters more than the odds suggest.
+  if [ "$seeded" = "true" ] && [ "$enabled" = "true" ] \
+     && [ "$slabel" != "$ibase" ] && [ "$slabel" != "$auto" ]; then
+    [ "$CLEAR" = "1" ] || ar_state_del "$key"
+    enabled="" auto=""
+  fi
+  # herdr saves session.json on a 5-second debounce, so a cd the shell hook has
+  # already applied reads back here as the directory the workspace LEFT, and the
+  # pass would rename it back -- once per prompt, for as long as the file lags,
+  # since our own rename is an event we subscribe to. Where the panes still say
+  # what we last wrote, the file is simply behind: herdr derives identity_cwd
+  # from the workspace's active pane, so the pane's directory is the value the
+  # file is about to carry. Only that exact agreement counts, so a pane guess
+  # that matches neither the file nor our record changes nothing and the file
+  # stays the answer -- which is the case a live session paid for.
+  #
+  # The record is compared against the pane's base REWRITTEN, because that is
+  # the shape the record is in: what we last wrote is a label, and a label has
+  # WORKSPACE_SUBSTITUTE_SETS applied to it. Comparing it against the raw base
+  # switched this guard off for exactly the workspaces a rule matches, and the
+  # reconcile then reverted every rename the prompt made until session.json
+  # caught up. `ar_ws_subst` is identity on an empty rule list, so a config with
+  # no rules compares what it always compared, and forks nothing to do it.
+  if [ -n "$pbase" ] && [ "$pbase" != "$ibase" ] \
+     && [ "$enabled" = "true" ] && [ "$auto" = "$(ar_ws_subst "$pbase")" ]; then
+    ibase=$pbase
+  fi
+  AR_WS_IBASE=$ibase
+  AR_WS_STATE_ENABLED=$enabled
+  AR_WS_STATE_AUTO=$auto
+  if [ "$slabel" = "$ibase" ]; then
+    return 0
+  elif [ "$enabled" = "true" ] && [ "$slabel" = "$auto" ]; then
     return 0
   fi
-  rows=$(printf '%s' "$AR_PANES_JSON" | jq -r \
-    --arg t "$tid" --arg token "$AR_TAB_NUMBER_TOKEN" --arg want "$pos" '
-      (.result.panes // .panes // [])[]
-      | select(.tab_id == $t)
-      | select((((.tokens // {})[$token]) // "") != $want)
-      | .pane_id // empty
-    ' 2>/dev/null)
+  # --clear reaches this function now, because a rewrite has to be handed back
+  # before the prefix comes off it, and the uninstall path decides nothing about
+  # ownership on its way out: it strips what is there and writes no state.
+  [ "$CLEAR" = "1" ] || [ "$enabled" = "false" ] || ar_state_set "$key" "" false
+  return 1
+}
+
+# ar_ws_claim <workspace_id> <base> - record that we own this workspace's base,
+# unless state already says exactly that (the steady state, every pass, for every
+# tracked workspace: ar_state_set rewrites the whole file). Reads what
+# ar_ws_track_eligible published for this same workspace. Only ever called for a
+# base the workspace CARRIES -- a base recorded for a rename that never landed
+# reads as a hand-typed name one pass later, and opts the workspace out.
+ar_ws_claim() {
+  if [ "${AR_WS_STATE_ENABLED:-}" = "true" ] && [ "${AR_WS_STATE_AUTO:-}" = "$2" ]; then
+    return 0
+  fi
+  ar_state_set "ws:$1" "$2" true
+}
+
+
+# ar_state_prune_ws <keep workspace_ids...> - drop the "ws:" records of
+# workspaces that no longer exist, and touch no other key (the tabs own theirs,
+# and ar_state_prune is called with tab ids alone). Writes only when the pruned
+# document differs, so a steady session leaves the file alone.
+ar_state_prune_ws() {
+  local keep base pruned tmp
+  # Same as ar_state_prune: no ids is an empty keep list of [""], which matches
+  # no workspace and would drop every "ws:" record.
+  [ "$#" -gt 0 ] || return 0
+  keep=$(printf '%s\n' "$@" | jq -R . | jq -s .) || return 0
+  base=$(ar_state_read) || return 0                      # unreadable: leave it alone
+  pruned=$(printf '%s' "$base" | jq -c --argjson keep "$keep" \
+    'with_entries(select((.key | startswith("ws:") | not)
+                         or ((.key | ltrimstr("ws:")) as $w | $keep | index($w))))' \
+    2>/dev/null) || return 0
+  [ -n "$pruned" ] && [ "$pruned" != "$base" ] || return 0
+  AR_STATE_ROWS_LOADED=""
+  tmp=$(mktemp "$STATE_DIR/.state.XXXXXX") || return 0
+  if printf '%s' "$pruned" > "$tmp"; then mv "$tmp" "$STATE_FILE"; else rm -f "$tmp"; fi
+}
+
+# Workspaces: number them by herdr's visible sidebar order, and keep the base
+# tracking the workspace's directory. Arg 1 is a cached `workspace list` JSON.
+#
+# The base comes from herdr's identity_cwd, not from the label we wrote last pass.
+# Recycling the label is what made issue #13: the first numbering rename freezes
+# herdr's own directory derivation, so a label built out of the previous label can
+# never move again, and a workspace kept the name it had when it was created.
+# Ownership decides per workspace whether that swap applies (ar_ws_track_eligible).
+#
+# WORKSPACE_SUBSTITUTE_SETS rewrites that base on its way to the sidebar, and
+# only there: the directory, the Git worktree, and what this workspace's tabs
+# dedupe against are all still the derived name. --clear is the one pass that
+# takes the rewrite back, handing over the derived base and stripping the prefix
+# off that, which is why it now reads the derivation it used to skip.
+ar_renumber_workspaces() {
+  local json=$1 rows wid label pos base lprefix dedupe want ibase track seen=""
+  AR_WS_BASES=""
+  [ -n "$json" ] || return 0
+  # Read with its status: a jq that fails after emitting some rows would leave
+  # the missing workspaces out of the keep list, and ar_state_prune_ws would drop
+  # their records. Nothing is numbered or pruned from a row set that is not whole.
+  rows=$(ar_workspace_positions "$json" "$(ar_collapsed_spaces)") || return 0
   [ -n "$rows" ] || return 0
-  while IFS= read -r pid; do
-    [ -n "$pid" ] || continue
-    "$HERDR" pane report-metadata "$pid" \
-      --source "$AR_METADATA_SOURCE" \
-      --token "$AR_TAB_NUMBER_TOKEN=$pos" >/dev/null 2>&1 || true
+  AR_WS_IDENTITY=""
+  AR_WS_PANEDIR=""
+  # The derivation is read under --clear too when there are rules to undo, which
+  # it did not have to be while a "[N] " prefix was the only thing this plugin
+  # put on a workspace: stripping the prefix off "[1] wt-feature" would leave
+  # "wt-feature" standing, on the uninstall path, with the plugin that could
+  # have taken it back about to be gone. The panes come with it either way, so
+  # the correction for a session.json that lags a live cd applies on that pass
+  # too (ar_ws_track_eligible) -- reading the derivation without them would hand
+  # back the directory the workspace has just left.
+  if ar_ws_derives; then
+    AR_WS_IDENTITY=$(ar_workspace_identities)
+    AR_WS_PANEDIR=$(ar_workspace_pane_dirs "$json")
+  fi
+  while IFS=$AR_ROW_SEP read -r wid label pos; do
+    [ -n "$wid" ] || continue
+    seen="$seen $wid"
+    base=$(ar_strip_prefix "$label")
+    # The prefix as the STRIP saw it, which is the only spelling of it that
+    # cannot disagree with the base beside it. ar_index_prefix is documented as
+    # ar_strip_prefix's exact inverse and is not one on a malformed label:
+    # "[1]: [done] task" strips to itself while ar_index_prefix still reads a
+    # "[1] " off it, and re-joining those two renames a row this pass promised
+    # to leave alone. Taking the base back off the label instead is a no-op on
+    # exactly the labels the strip refused.
+    lprefix=${label%"$base"}
+    dedupe=$base
+    track=0
+    if ibase=$(ar_identity_base "$wid") \
+       && ar_ws_track_eligible "$wid" "$base" "$ibase" "$(ar_panedir_base "$wid")"; then
+      # The rewrite is display only, so the two part company here: the workspace
+      # is RENAMED to the rewritten spelling, and its tabs go on deduping against
+      # the directory-derived one. A tab sitting in worktree-feature/ would
+      # otherwise stop recognizing its own workspace and re-inject the long name
+      # it was rewritten to lose ("worktree-feature > nvim" under a "wt-feature"
+      # sidebar).
+      dedupe=$AR_WS_IBASE
+      # --clear is on its way out and takes the rewrite with it, so it hands
+      # back the derived name and strips the prefix off THAT. Leaving the
+      # rewrite behind would strand it: it is documented as the last step before
+      # uninstall, after which the plugin that could restore the label is gone.
+      if [ "$CLEAR" = "1" ]; then
+        base=$AR_WS_IBASE
+      else
+        base=$(ar_ws_subst "$AR_WS_IBASE")
+      fi
+      track=1
+    fi
+    [ -n "$base" ] || continue          # empty label: nothing to number, leave it
+    if ar_index_pass workspaces; then
+      want=$(ar_desired workspaces "$pos" "$base")  # position 0 (hidden) -> bare, like 10+
+    else
+      # The pass is here for the rewrite alone, on a config that never named
+      # workspace numbering. ar_index_explicit's contract is that such a config
+      # asks for neither the numbering nor the strip and is left exactly as it
+      # was, so whatever "[3] " this row carries -- ours from before numbering
+      # was switched off, or somebody's own text, which nothing here can tell
+      # apart -- is carried over rather than taken off. A row this pass does not
+      # own therefore ends up with the label it arrived with, and is not renamed
+      # at all.
+      want="$lprefix$base"
+    fi
+    if [ "$want" != "$label" ]; then
+      "$HERDR" workspace rename "$wid" "$want" >/dev/null 2>&1 || continue
+    fi
+    # What this workspace is called AFTER this pass, for the tab pass to dedupe
+    # against (ar_ws_base). It reads the workspace list this pass fetched, which
+    # was fetched before the rename above, so a workspace re-labelled from its
+    # directory here would otherwise have its tabs deduped against the name it
+    # had a moment ago -- and a tab in the web workspace would read "web > nvim"
+    # until some later event refreshed the list. Recorded only past the rename,
+    # so a rename herdr rejected leaves the stale label standing, which is what
+    # the workspace still carries.
+    AR_WS_BASES="$AR_WS_BASES$wid$AR_ROW_SEP$dedupe
+"
+    # --clear keeps its records, exactly as the tab half does: the rules are
+    # still in the config, and the next event is entitled to apply them again.
+    [ "$track" = "1" ] && [ "$CLEAR" != "1" ] && ar_ws_claim "$wid" "$base"
   done <<< "$rows"
+  # A workspace id carries no whitespace (both go through `clean`), so the
+  # space-joined list splits into one argument per workspace.
+  # An empty list is not "keep nothing": with nothing seen there is nothing to
+  # confirm gone, and pruning on it dropped every workspace record.
+  # shellcheck disable=SC2086
+  [ "$CLEAR" = "1" ] || [ -z "$seen" ] || ar_state_prune_ws $seen
 }
 
 # Tabs: cmd+N indexes the focused workspace's tabs by ARRAY ORDER (NOT the
@@ -556,52 +1925,82 @@ ar_sync_tab_number_token() {
 # are the only item both features touch), so per tab we compute the base ONCE
 # (naming if owned/eligible, else the stripped current base) and apply the
 # position prefix in a single rename. Arg 1 is the cached `workspace list` JSON.
+# ar_ws_base <workspace_id> <label> -> the base its tabs dedupe against: what
+# the workspace pass just applied, else the label as fetched with its numbering
+# prefix off. A loop over rows rather than a jq, like ar_identity_base next door:
+# a pass sees every workspace once and the list is short.
+ar_ws_base() {
+  local wid=$1 k v
+  if [ -n "${AR_WS_BASES:-}" ]; then
+    while IFS=$AR_ROW_SEP read -r k v; do
+      if [ "$k" = "$wid" ]; then printf '%s' "$v"; return 0; fi
+    done <<< "$AR_WS_BASES"
+  fi
+  ar_strip_prefix "$2"
+}
+
 ar_reconcile_tabs() {
-  local wsjson=$1 wsrows w tjson rows tid label pcount foc base0 base named name i want
-  # A failed or malformed read is not evidence that the missing tabs closed.
-  # Validate whole lists before consuming any rows, including each id that will
-  # enter the space-separated prune list.
-  wsrows=$(printf '%s' "$wsjson" | jq -r -s '
-    if length == 1 then .[0] else error("expected one workspace response") end
+  local wsjson=$1 w wslabel wsbase tjson rows tid label pcount foc base0 base named name i want notag tag tagok
+  [ -n "$wsjson" ] || return 0
+  # The workspace's own label comes down with its id: a tab in the workspace
+  # named after its own directory drops that half of its name (ar_context_dir),
+  # and the numbering prefix comes off first because what it is compared against
+  # is a directory name, which "[1] api" is not.
+  #
+  # The rows are read with their status. A jq that fails after emitting some of
+  # them would leave the tabs of the missing workspaces out of AR_SEEN_TABS with
+  # nothing marking the pass partial, and the prune would drop their records.
+  local wsrows
+  wsrows=$(printf '%s' "$wsjson" | jq -r -s "$AR_JQ_CLEAN"'
+    if length == 1 then .[0] else error("multiple workspace responses") end
     | (.result.workspaces // .workspaces)
-    | if type == "array" and all(.[];
-        .workspace_id | type == "string" and length > 0 and (test("[[:space:][:cntrl:]]") | not))
-      then .[].workspace_id else error("incomplete workspace list") end
-  ' 2>/dev/null) || { AR_TABS_PARTIAL=1; return 0; }
-  while IFS= read -r w; do
+    | if type == "array" and all(.[]; .workspace_id | type == "string" and length > 0 and (test("[[:space:][:cntrl:]]") | not))
+      then .[] else error("incomplete workspace list") end
+    | [ (.workspace_id | clean), (.label | clean) ] | join([31] | implode)' 2>/dev/null) \
+    || { AR_TABS_PARTIAL=1; wsrows=""; }
+  while IFS=$AR_ROW_SEP read -r w wslabel; do
     [ -n "$w" ] || continue
+    wsbase=$(ar_ws_base "$w" "$wslabel")
     if [ "${AR_HAVE_SNAPSHOT:-0}" = "1" ]; then
       # Slice this workspace's tabs out of the cached snapshot, preserving array
-      # order (what cmd+N numbers by). Same shape as `tab list --workspace`.
+      # order (what cmd+N numbers by). Same shape as `tab list --workspace`, plus
+      # the _name_pane the reshape joined on (see ar_resolve_pane).
       tjson=$(printf '%s' "$AR_SNAP_TABS_JSON" | jq -c --arg w "$w" \
-        '.result.tabs
-         | if type == "array" and all(.[];
-             .workspace_id | type == "string" and length > 0 and (test("[[:space:][:cntrl:]]") | not))
-           then {result:{tabs:[.[]|select(.workspace_id==$w)]}}
-           else error("incomplete snapshot tab list") end' 2>/dev/null) \
-        || { AR_TABS_PARTIAL=1; continue; }
+        '.result.tabs | if type == "array" and all(.[]; .workspace_id | type == "string" and length > 0 and (test("[[:space:][:cntrl:]]") | not)) then {result:{tabs:[.[]|select(.workspace_id==$w)]}} else error("incomplete snapshot tabs") end' 2>/dev/null)
     else
+      # A workspace whose tabs could not be read still has them. Each skip below
+      # marks the pass partial so the prune after it leaves every record alone:
+      # a tab pruned while it exists reads as hand-renamed on the next pass and
+      # opts out for good, and one failed `tab list` used to do that to a whole
+      # workspace.
       tjson=$("$HERDR" tab list --workspace "$w" 2>/dev/null) || { AR_TABS_PARTIAL=1; continue; }
     fi
-    rows=$(printf '%s' "$tjson" | jq -r -s '
-      if length == 1 then .[0] else error("expected one tab response") end
+    [ -n "$tjson" ] || { AR_TABS_PARTIAL=1; continue; }
+    rows=$(printf '%s' "$tjson" | jq -r -s "$AR_JQ_CLEAN"'
+      if length == 1 then .[0] else error("multiple tab responses") end
       | (.result.tabs // .tabs)
-      | if type == "array" and all(.[];
-          .tab_id | type == "string" and length > 0 and (test("[[:space:][:cntrl:]]") | not))
+      | if type == "array" and all(.[]; .tab_id | type == "string" and length > 0 and (test("[[:space:][:cntrl:]]") | not))
         then .[] else error("incomplete tab list") end
-      | [ .tab_id, (.label // ""), (.pane_count // 0), (.focused // false) ] | @tsv' 2>/dev/null) \
-      || { AR_TABS_PARTIAL=1; continue; }
+      | [ (.tab_id | clean), (.label | clean), ((.pane_count // 0) | tostring),
+          ((.focused // false) | tostring), (._name_pane // ""),
+          (((.label // "") != (.label | clean)) | tostring),
+          (._name_agent // ""), (._name_title // ""), (._name_title_lc // ""),
+          (._name_dir_lc // ""), (._name_dir // ""), (._name_session // "") ]
+      | join([31] | implode)' 2>/dev/null) || { AR_TABS_PARTIAL=1; continue; }
+    # No rows is a workspace with no tabs, which was read in full: only a jq that
+    # failed above is a workspace the prune must not judge.
     [ -n "$rows" ] || continue
     i=0
-    while IFS=$'\t' read -r tid label pcount foc; do
+    while IFS=$AR_ROW_SEP read -r tid label pcount foc lpane dirty \
+      AR_PANE_AGENT AR_PANE_TITLE AR_PANE_TITLE_LC AR_PANE_DIR_LC AR_PANE_DIR \
+      AR_PANE_SESSION; do
       [ -n "$tid" ] || continue
       i=$(( i + 1 ))
-      if [ "${AR_TAB_METADATA_OK:-0}" = "1" ] && [ "$CLEAR" != "1" ] \
-         && [ "$AUTO_INDEX" = "1" ]; then
+      if [ "${AR_TAB_METADATA_OK:-0}" = "1" ] && [ "$CLEAR" != "1" ] && ar_index_on tabs; then
         ar_sync_tab_number_token "$tid" "$i"
       fi
       AR_SEEN_TABS="$AR_SEEN_TABS $tid"
-      base0=$(ar_strip_prefix "$label")
+      base0=$(ar_tab_strip_prefix "$label" "$(ar_tag_strip_ok "$tid")")
       base=$base0
       named=0
       if [ "$CLEAR" != "1" ] && [ "$NAME_TABS" = "1" ]; then
@@ -609,10 +2008,11 @@ ar_reconcile_tabs() {
         # the knob off it is not, because a config can erase a name it did compute
         # (MAX_NAME_LEN=0, a SUBSTITUTE_SETS rule that matches everything) and
         # blanking a tab over that was never the deal. The fast path declines it too.
-        if ar_name_eligible "$tid" "$base0" && name=$(ar_tab_name "$tid" "$pcount" "$foc") \
+        if ar_name_eligible "$tid" "$base0" && name=$(ar_tab_name "$tid" "$pcount" "$foc" "$lpane" "$wsbase") \
            && { [ -n "$name" ] || [ "${HIDE_SHELL:-0}" = "1" ]; }; then
           base=$name
           named=1
+          ar_trace "$tid name computed: [$name]"
         fi
       fi
       # herdr has not labeled this tab yet and we computed no name, so there is no
@@ -622,12 +2022,12 @@ ar_reconcile_tabs() {
       # an earlier hidden pass, which still has to follow a renumber and to be
       # stripped by --clear. Both of those have a label, so testing it is enough.
       if [ -z "$label" ] && [ "$named" = "0" ]; then
+        ar_trace "$tid left alone: no label yet and no name computed"
         continue
       fi
       # Placeholder skip: with naming ON but no name computed yet, a bare-integer
       # base is herdr's transient placeholder ("3"). Numbering it now would flash
-      # a throwaway "[3] 3" that the next event/shell hook replaces with the
-      # real prompt label.
+      # a throwaway "[3] 3" that the next event/zsh hook clobbers to "[3] zsh".
       # Defer this pass; the position (i) is still counted so later tabs are
       # correct. With naming OFF we DO number it (nothing else ever will), and
       # --clear must strip, so both skip this guard. An EMPTY base is not a
@@ -636,13 +2036,56 @@ ar_reconcile_tabs() {
       # to carry no name, so there is nothing to wait for.
       if [ "$CLEAR" != "1" ] && [ "$NAME_TABS" = "1" ] && [ "$named" = "0" ] \
          && [ -n "$base" ] && ar_is_placeholder "$base"; then
+        ar_trace "$tid deferred placeholder: [$base]"
         continue
       fi
-      want=$(ar_desired "$i" "$base")
+      # A base still headed by this machine's name, where a tag may be about
+      # to go on (the knob) or owes to come off (the row), is either residue
+      # nobody can spell or a hand name that starts with the machine name,
+      # and prepending the current tag onto either would stack generation on
+      # generation. A row we tagged (ar_row_tagged_p) carries that residue:
+      # the label and its row are left exactly as they are until reset. A
+      # row we never tagged is a hand name, which keeps its text and follows
+      # its number like any hand name, and simply never gains the tag.
+      # --clear stays exempt below: it is the explicit instruction to take
+      # off what it can.
+      tagok=0
+      [ "${HOST_PREFIX:-0}" = "1" ] && tagok=1
+      [ "$(ar_tag_strip_ok "$tid")" = "1" ] && tagok=1
+      notag=0
+      if [ "$CLEAR" != "1" ] && [ "$named" = "0" ] && ar_tag_head_p "$base" "$tagok"; then
+        if ar_row_tagged_p "$tid"; then
+          ar_trace "$tid left alone: host tag ahead of the base in a spelling we cannot take off"
+          continue
+        fi
+        ar_trace "$tid hand-named: host-headed base follows its number without a tag"
+        notag=1
+      fi
+      want=$(ar_desired tabs "$i" "$base")
+      # The first tab carries this machine's name ahead of everything else --
+      # the left-edge slot herdr's own tab bar offers no status area for. Tag
+      # first, number second, base third ("HPmini: [1] api › nvim"). Never
+      # under --clear: that is the path a switched-off tag comes back off by,
+      # and base0 above already read the label with the tag stripped. The same
+      # condition is what the claim records as `tagged`: the store has to know
+      # the label carries a tag it may later have to take back off, which is
+      # the one thing the label alone will not tell it once the knob is off.
+      tagged=0
+      if [ "$notag" = "0" ] && [ "$i" -eq 1 ] && [ "$CLEAR" != "1" ] && [ "${HOST_PREFIX:-0}" = "1" ] \
+         && tag=$(ar_host_tag) && [ -n "$tag" ]; then
+        want="$tag$want"
+        tagged=1
+      fi
       if [ "$named" = "1" ]; then
-        ar_rename_owned_tab "$tid" "$name" "$label" "$want" || continue
-      elif [ "$want" != "$label" ]; then
-        "$HERDR" tab rename "$tid" "$want" >/dev/null 2>&1 || continue
+        ar_rename_owned_tab "$tid" "$name" "$label" "$want" "$wsbase" "$tagged" "$dirty" || continue
+      else
+        if [ "$want" != "$label" ]; then
+          "$HERDR" tab rename "$tid" "$want" >/dev/null 2>&1 || continue
+          ar_trace "$tid rename issued: [$label] -> [$want]"
+        else
+          ar_trace "$tid label already correct: [$want]"
+        fi
+        ar_state_retag "$tid" "$tagged"
       fi
     done <<< "$rows"
   done <<< "$wsrows"
@@ -711,14 +2154,25 @@ ar_version_lt() {
 # ar_herdr_version -> the running herdr's dotted version ("0.8.0"), or rc 1 when
 # it cannot be read. `herdr --version` prints "herdr <version>"; take the first
 # field shaped like a number and drop any trailing build metadata.
+#
+# Asked once per process and remembered, a failure included ("-"): the binary
+# cannot change version underneath one event, and a pass that loops (ar_run's
+# coalescing re-pass) already has its answer. Every event asked before, which
+# on the pane.agent_status_changed stream is a fork for a value that is the
+# same every time.
 ar_herdr_version() {
+  if [ -n "${AR_HERDR_VERSION_MEMO:-}" ]; then
+    [ "$AR_HERDR_VERSION_MEMO" = "-" ] && return 1
+    printf '%s' "$AR_HERDR_VERSION_MEMO"; return 0
+  fi
   local out f
-  out=$("$HERDR" --version 2>/dev/null) || return 1
+  out=$("$HERDR" --version 2>/dev/null) || { AR_HERDR_VERSION_MEMO="-"; return 1; }
   for f in $out; do
     case "$f" in
-      [0-9]*.[0-9]*) printf '%s' "${f%%[!0-9.]*}"; return 0 ;;
+      [0-9]*.[0-9]*) AR_HERDR_VERSION_MEMO="${f%%[!0-9.]*}"; printf '%s' "$AR_HERDR_VERSION_MEMO"; return 0 ;;
     esac
   done
+  AR_HERDR_VERSION_MEMO="-"
   return 1
 }
 
@@ -736,17 +2190,10 @@ ar_herdr_version() {
 # Workspace and tab renames are unaffected -- those labels are free-form.
 ar_agent_prefix_ok() {
   local v
-  v=$(ar_herdr_version) || return 1
-  ar_version_lt "$v" "0.7.5"
-}
-
-# ar_tab_metadata_ok -> 0 when pane custom metadata and row tokens are available.
-# `pane report-metadata` arrived in herdr 0.8.0. An unreadable version disables
-# reporting so older installations keep working without rejected CLI calls.
-ar_tab_metadata_ok() {
-  local v
-  v=$(ar_herdr_version) || return 1
-  ! ar_version_lt "$v" "0.8.0"
+  # Called in THIS shell, not through $(...), or the memo dies with the subshell
+  # and every caller pays the herdr round-trip again.
+  ar_herdr_version >/dev/null || return 1
+  ar_version_lt "$AR_HERDR_VERSION_MEMO" "0.7.5"
 }
 
 # ar_agent_sort -> "priority" or "spaces" (grouped). herdr renders the agent panel
@@ -756,17 +2203,33 @@ ar_tab_metadata_ok() {
 # exposes neither the panel's displayed order nor a resort event, so in "priority"
 # mode we cannot know the order a static "[N]" would have to match. We therefore
 # number agents only in grouped mode (where agent-list order IS the panel order)
-# and strip the prefixes in "priority" mode (see ar_renumber_agents). herdr
-# rewrites agent_panel_sort into config.toml the instant the sort is toggled, so
-# the file is the live source of truth; default (key unset) is "spaces".
-# A named session keeps its own config.toml beside its session.json, so the path
-# comes from ar_herdr_session_dir; HERDR_CONFIG_FILE overrides it for testing.
+# and strip the prefixes in "priority" mode (see ar_renumber_agents). The sort
+# comes off the same two files, in the same order, as ar_collapsed_spaces reads
+# collapse from. On 0.9.0 and up the live value is agent_panel_sort in the
+# client's preference file, written the instant the sort is toggled and absent
+# until it is, and config.toml is only the value the client started from. Below
+# 0.9.0 the server rewrote config.toml on every toggle and there is no client
+# file, so config.toml is the live value there. Default (neither says) is
+# "spaces". A named session keeps its own config.toml beside its session.json, so
+# the path comes from ar_herdr_session_dir; HERDR_CONFIG_FILE overrides it for
+# testing.
 ar_agent_sort() {
-  local cfg="${HERDR_CONFIG_FILE:-$(ar_herdr_session_dir)/config.toml}" line
-  line=$(grep -E '^[[:space:]]*agent_panel_sort[[:space:]]*=' "$cfg" 2>/dev/null | tail -n1)
-  case "${line#*=}" in
-    *priority*) printf 'priority' ;;
-    *)          printf 'spaces' ;;
+  local prefs cfg line sort=""
+  prefs=$(ar_herdr_client_prefs)
+  if [ -r "$prefs" ]; then
+    sort=$(jq -r -s 'if length == 1 and (.[0] | type) == "object"
+      then .[0].agent_panel_sort // empty | strings else empty end' "$prefs" 2>/dev/null) || sort=""
+  fi
+  if [ -z "$sort" ]; then
+    cfg="${HERDR_CONFIG_FILE:-$(ar_herdr_session_dir)/config.toml}"
+    line=$(grep -E '^[[:space:]]*agent_panel_sort[[:space:]]*=' "$cfg" 2>/dev/null | tail -n1)
+    sort=${line#*=}
+    sort=${sort%%#*}
+    sort=$(printf '%s' "$sort" | tr -d ' "'"'"'\t')
+  fi
+  case "$sort" in
+    priority) printf 'priority' ;;
+    *)        printf 'spaces' ;;
   esac
 }
 
@@ -796,24 +2259,35 @@ ar_renumber_agents() {
     json=$("$HERDR" agent list 2>/dev/null) || return 0
   fi
   [ -n "$json" ] || return 0
-  rows=$(printf '%s' "$json" | jq -r '
+  rows=$(printf '%s' "$json" | jq -r "$AR_JQ_CLEAN"'
     (.result.agents // .agents // [])[]
-    | [ (.pane_id // .terminal_id // ""), (.name // .agent // ""), (.agent_session.agent // .agent // "") ] | @tsv' 2>/dev/null)
+    | [ (.pane_id // .terminal_id // "" | clean), (.name // .agent // "" | clean),
+        (.agent_session.agent // .agent // "" | clean) ]
+      | join([31] | implode)' 2>/dev/null)
   [ -n "$rows" ] || return 0
 
-  # Revert to detection (strip our "[N]") on uninstall, on a herdr that rejects
-  # bracketed agent names, OR whenever the agent panel is priority-sorted: a
-  # fixed-order number can only be wrong against a queue we cannot observe.
-  # Grouped mode on an older herdr falls through to numbering below.
+  # Revert to detection (strip our "[N]") on uninstall, with agent numbering
+  # switched off, on a herdr that rejects bracketed agent names, OR whenever the
+  # agent panel is priority-sorted: a fixed-order number can only be wrong
+  # against a queue we cannot observe. Grouped mode on an older herdr with the
+  # scope on falls through to numbering below.
+  #
+  # The toggle is tested BEFORE the two probes below on purpose: ar_agent_prefix_ok
+  # shells out for the herdr version and ar_agent_sort reads config.toml, and a
+  # config with agents switched off should not pay for either on every event.
+  # Of the two probes, the file read goes first: either answer alone forces the
+  # strip, so a priority-sorted panel never spawns the version query at all.
   if [ "$CLEAR" = "1" ]; then
     strip=1
-  elif ! ar_agent_prefix_ok; then
+  elif ! ar_index_on agents; then
     strip=1
   elif [ "$(ar_agent_sort)" = "priority" ]; then
     strip=1
+  elif ! ar_agent_prefix_ok; then
+    strip=1
   fi
   if [ "$strip" = "1" ]; then
-    while IFS=$'\t' read -r tid label detected; do
+    while IFS=$AR_ROW_SEP read -r tid label detected; do
       [ -n "$tid" ] || continue
       base=$(ar_strip_prefix "$label")
       base=$(ar_unpark_base "$base" "$detected")
@@ -824,7 +2298,7 @@ ar_renumber_agents() {
   fi
 
   local -a P_TID P_WANT
-  while IFS=$'\t' read -r tid label detected; do
+  while IFS=$AR_ROW_SEP read -r tid label detected; do
     [ -n "$tid" ] || continue
     i=$(( i + 1 ))
     base=$(ar_strip_prefix "$label")
@@ -832,7 +2306,7 @@ ar_renumber_agents() {
     # A slot with no name AND no detected kind still counts toward the position
     # but we can't form "[N] base" for it -- leave it until herdr names it.
     [ -n "$base" ] || continue
-    want=$(ar_desired "$i" "$base")
+    want=$(ar_desired agents "$i" "$base")
     [ "$want" = "$label" ] && continue
     if [ "$i" -ge 1 ] && [ "$i" -le 9 ]; then
       P_TID+=("$tid"); P_WANT+=("$want")
@@ -853,35 +2327,168 @@ ar_renumber_agents() {
   done
 }
 
-# ar_wait_tab_gone <tab_id> - block (bounded ~3s) until a just-closed tab has left
+# ar_wait_tab_gone <tab_id> - block (bounded ~2s) until a just-closed tab has left
 # herdr's model, so the reconcile that follows never numbers by a stale list.
 # herdr keeps a closing tab in `tab list` until its pane finishes tearing down;
 # the tab.closed event fires while it is still listed, so an immediate reconcile
 # would find every number already correct and change nothing. Waiting for the id
 # to disappear turns that race into a settled read.
+#
+# Seven polls that back off, rather than sixty at a fixed 50ms: a pane usually
+# goes within the first two, and a tab that is still listed after a second is
+# one the reconcile will meet again on the next event anyway. No jq per poll:
+# a tab that is gone comes back as `{}` or an error object from herdr and the
+# mock alike, and neither carries a "tab_id" key.
 ar_wait_tab_gone() {
-  local t=$1 i=0 raw
+  local t=$1 raw d
+  local delays="0.05 0.05 0.1 0.1 0.2 0.3 0.5 0.7"
   [ -n "$t" ] || return 0
-  while [ "$i" -lt 60 ]; do
+  for d in $delays; do
     raw=$("$HERDR" tab get "$t" 2>/dev/null) || return 0
     [ -n "$raw" ] || return 0
-    printf '%s' "$raw" | jq -e '(.result.tab // .tab) | has("tab_id")' >/dev/null 2>&1 || return 0
-    i=$(( i + 1 ))
-    sleep 0.05 2>/dev/null || return 0
+    case "$raw" in *'"tab_id"'*) ;; *) return 0 ;; esac
+    sleep "$d" 2>/dev/null || return 0
   done
+}
+
+# ar_own_rename <tab_id> -> 0 when the tab carries exactly the label this plugin
+# last wrote on it: state says the tab is ours, and the label herdr reports,
+# prefix stripped, is the recorded auto name. That is the tab.renamed our own
+# rename re-fires, and a full pass on it finds every number correct and changes
+# nothing. Everything else is rc 1, and the caller answers it with the full pass
+# it always ran: a hand rename, a tab nobody owns, a read that failed.
+#
+# A seeded record does not count. It is ar_state_seed's guess that the tab is
+# one the shared store owned, and the full pass is what confirms or drops it.
+#
+# The number is not checked, only the base: which number is right takes the
+# whole pass to know. A hand-typed wrong number over our base therefore waits
+# for the next event of any kind, where it used to be put right on this one.
+ar_own_rename() {
+  local t=$1 enabled auto ws seeded tagged raw label
+  ar_state_rows
+  # shellcheck disable=SC2034  # `ws` is named so it can be discarded
+  IFS=$AR_ROW_SEP read -r enabled auto ws seeded tagged <<< "$(ar_state_fields "$t")"
+  [ -z "${AR_STATE_ROWS_BAD:-}" ] || return 1
+  [ "$enabled" = "true" ] && [ -z "$seeded" ] || return 1
+  raw=$("$HERDR" tab get "$t" 2>/dev/null) || return 1
+  [ -n "$raw" ] || return 1
+  # One jq for both questions: `select` emits nothing for a tab without a
+  # label, and -e turns no output into a non-zero exit. A missing label must not
+  # read as an empty one, which an owned HIDE_SHELL tab legitimately carries.
+  label=$(printf '%s' "$raw" \
+    | jq -r -e "$AR_JQ_CLEAN"'(.result.tab // .tab) | select(has("label")) | .label | clean' \
+    2>/dev/null) || return 1
+  [ "$(ar_tab_strip_prefix "$label" "$(ar_tag_strip_ok "$t")")" = "$auto" ]
+}
+
+# ar_notify <title> <body> - tell the user an action ran. Both actions are meant
+# for a keybinding, where the only other feedback is the tab bar redrawing (or,
+# for a reset that finds nothing to re-adopt, nothing at all). Best effort: an
+# older herdr without `notification show` just declines.
+ar_notify() {
+  "$HERDR" notification show "$1" --body "$2" >/dev/null 2>&1 || true
+}
+
+# ar_trace <words...> - one line to $AR_TRACE_FILE when AR_TRACE is set, else
+# nothing. Every failure this plugin has looks the same from outside (nothing
+# happens), and the herdr calls all end in >/dev/null, so this is the one record
+# of what a pass saw and decided. The guard is a string compare, never a
+# subshell, so the hot path pays no fork with tracing off; `date` is a fork, and
+# runs only when it is on. The file inherits the state file's sensitivity (a
+# label can carry a task title), so it sits in the state dir at 0600.
+AR_TRACE_FILE="${AR_TRACE_FILE:-$STATE_DIR/trace.log}"
+ar_trace() {
+  [ -n "${AR_TRACE:-}" ] || return 0
+  # umask shapes a file this process creates and leaves one that already exists
+  # alone, so an old permissive log is tightened once per process, and BEFORE the
+  # first line lands in it rather than after.
+  [ -n "${AR_TRACE_TIGHTENED:-}" ] || { [ -e "$AR_TRACE_FILE" ] && chmod 600 "$AR_TRACE_FILE" 2>/dev/null; AR_TRACE_TIGHTENED=1; }
+  { umask 077; printf '%s %s %s\n' "$(date '+%H:%M:%S' 2>/dev/null)" "$$" "$*" >>"$AR_TRACE_FILE"; } 2>/dev/null || true
+}
+
+# ar_doctor <tab_id> - say why the tab has the name it has. Called by the doctor
+# action right after one real pass ran with tracing forced into $AR_TRACE_FILE,
+# so what it reports is what the pass did, never a parallel computation: a doctor
+# that disagrees with the pass is worse than none. Everything goes to stdout, for
+# a user who invoked it from the CLI; the versions, record and label also go out
+# as a notification, because a keybinding has no terminal to print to. An empty
+# <tab_id> is reported as such and the whole trace is shown instead, since the
+# question then is whether anything ran at all.
+ar_doctor() {
+  local tab=$1 enabled auto ws seeded tagged label raw ver jqver cfg lockline now rec head
+  if ar_herdr_version >/dev/null; then ver=$AR_HERDR_VERSION_MEMO; else ver="unreadable"; fi
+  jqver=$(jq --version 2>/dev/null) || jqver="not found"
+  if [ -f "$CONFIG_FILE" ]; then cfg="$CONFIG_FILE"; else cfg="$CONFIG_FILE (absent, defaults apply)"; fi
+  # The pass has released its lock by now, so a lock still standing is another
+  # process's, live or abandoned, and its age is what tells those apart (see
+  # ar_lock, which steals past 30s).
+  if [ -d "$LOCK_DIR" ]; then
+    now=$(date +%s 2>/dev/null || echo 0)
+    lockline="held by another process, $(( now - $(ar_lock_mtime "$LOCK_DIR" "$now") ))s old"
+  else
+    lockline="free"
+  fi
+  head="herdr $ver, jq $jqver
+state dir: $STATE_DIR
+config: $cfg
+lock: $lockline"
+  if [ -z "$tab" ]; then
+    head="$head
+tab: none resolved (no HERDR_TAB_ID, no action context, no focused tab)"
+  else
+    # The pass just wrote, so the rows it loaded are stale by design: read again.
+    AR_STATE_ROWS_LOADED=""
+    ar_state_rows
+    IFS=$AR_ROW_SEP read -r enabled auto ws seeded tagged <<< "$(ar_state_fields "$tab")"
+    if [ -z "$enabled" ]; then rec="none (no pass has recorded this tab)"
+    else rec="enabled=$enabled auto=[$auto] ws=[$ws]${seeded:+ seeded}"
+    fi
+    label="(tab not found)"
+    if raw=$("$HERDR" tab get "$tab" 2>/dev/null) && [ -n "$raw" ]; then
+      label=$(printf '%s' "$raw" | jq -r "$AR_JQ_CLEAN"'(.result.tab // .tab)
+        | if type == "object" and has("label") then "[" + (.label | clean) + "]"
+          else "(tab not found)" end' 2>/dev/null) || label="(unreadable)"
+    fi
+    head="$head
+tab: $tab
+record: $rec
+label: $label"
+  fi
+  printf '%s\n\n' "$head"
+  if [ -n "$tab" ]; then
+    printf 'trace, lines about this tab from one real pass:\n'
+    grep -F -- "$tab" "$AR_TRACE_FILE" 2>/dev/null
+  else
+    printf 'trace, the whole pass:\n'
+    cat "$AR_TRACE_FILE" 2>/dev/null
+  fi
+  printf '\nknobs: NAME_TABS=%s AUTO_INDEX=%s TAB_CONTEXT=%s AGENT_TITLES=%s HIDE_SHELL=%s HOST_PREFIX=%s\n' \
+    "${NAME_TABS:-1}" "${AUTO_INDEX:-1}" "${TAB_CONTEXT:-1}" "${AGENT_TITLES:-1}" "${HIDE_SHELL:-0}" "${HOST_PREFIX:-0}"
+  if [ -n "$tab" ]; then ar_notify "Doctor: $tab" "$head"
+  else ar_notify "Doctor: no tab resolved" "$head"
+  fi
 }
 
 # ======================================================================
 # passes
 # ======================================================================
 
-# Full reconcile of every list, gated by the toggles. --clear ignores the toggles
-# and strips everything (the uninstall path).
+# Full reconcile of every list. Each pass consults its own toggle to decide
+# whether to number or to strip; --clear ignores the toggles and strips
+# everything (the uninstall path).
 ar_reconcile() {
-  local wsjson snap need_panes=0
+  local wsjson snap
+  AR_PANES_JSON='{"result":{"panes":[]}}'
+  AR_TAB_METADATA_OK=0
+  ar_tab_metadata_ok && AR_TAB_METADATA_OK=1
   # A reset deletes the target tab's state once (under the lock) so it re-adopts.
+  # Whether there was anything to re-adopt is read BEFORE the delete, because that
+  # is what the action reports back and `del` on a key that was never there
+  # succeeds quietly: a stale tab id would otherwise be told it was re-adopted.
   if [ -n "${AR_FORCE_TAB:-}" ] && [ -z "${AR_FORCE_DONE:-}" ]; then
-    ar_state_del "$AR_FORCE_TAB" || return 0
+    [ "$(ar_state_get "$AR_FORCE_TAB" enabled)" = "false" ] && AR_FORCE_WAS_OUT=1
+    ar_state_del "$AR_FORCE_TAB"
     AR_FORCE_DONE=1
   fi
   # One `herdr api snapshot` (herdr >= 0.7.2) carries the workspace, tab, pane,
@@ -895,113 +2502,320 @@ ar_reconcile() {
   # herdr with no `api snapshot`, a socket hiccup) falls back to the separate list
   # calls, so this never raises the plugin's min herdr version. Per-tab foreground
   # detection (`pane process-info`) is unaffected -- the snapshot carries panes but
-  # not each pane's foreground process, so naming still samples per named tab;
-  # cwd comes from the cached pane slice itself.
+  # not each pane's foreground process, so naming still samples per named tab.
   AR_HAVE_SNAPSHOT=0
   AR_SNAP_TABS_JSON=""
   AR_SNAP_AGENTS_JSON=""
-  AR_PANES_JSON='{"result":{"panes":[]}}'
-  AR_TAB_METADATA_OK=0
-  ar_tab_metadata_ok && AR_TAB_METADATA_OK=1
-  if { [ "$CLEAR" != "1" ] && [ "$NAME_TABS" = "1" ]; } \
-     || [ "$AR_TAB_METADATA_OK" = "1" ]; then
-    need_panes=1
-  fi
   snap=$("$HERDR" api snapshot 2>/dev/null) || snap=""
   if [ -n "$snap" ] && printf '%s' "$snap" \
-       | jq -e -s 'length == 1 and (.[0] | (.result.snapshot // .snapshot)
-           | (.workspaces | type == "array") and (.tabs | type == "array"))' >/dev/null 2>&1; then
+       | jq -e -s 'length == 1 and (.[0] | (.result.snapshot // .snapshot) | (.workspaces | type == "array") and (.tabs | type == "array"))' >/dev/null 2>&1; then
     AR_HAVE_SNAPSHOT=1
+    ar_trace "snapshot path"
     wsjson=$(printf '%s' "$snap" | jq -c \
       '{result:{workspaces:((.result.snapshot // .snapshot).workspaces // [])}}' 2>/dev/null)
+    # Each tab carries the pane its NAME comes from as _name_pane: per-tab data,
+    # joined here so the tab loop never asks for it again (see ar_resolve_pane).
+    #
+    # Which pane that is, in order:
+    #   1. the tab's own focused pane, when an agent is running in it;
+    #   2. any pane of the tab holding an agent that is working or blocked;
+    #   3. the tab's own focused pane.
+    # A tab split between an agent and a shell is about the agent, and it stays
+    # about the agent while you read the shell half -- but an IDLE agent does not
+    # outrank whatever you are actually looking at.
+    #
+    # A herdr with no layouts cannot answer rules 1 or 3, since both are the tab's
+    # own focused pane, so such a tab is picked by rule 2 or not at all: an agent at
+    # work still names its tab there, and everything else falls to the pane-list
+    # inference in ar_resolve_pane. Deliberate -- the rule needs no layout, and a
+    # split with an agent working in it is the case the rule exists for.
     AR_SNAP_TABS_JSON=$(printf '%s' "$snap" | jq -c \
-      '{result:{tabs:((.result.snapshot // .snapshot).tabs // [])}}' 2>/dev/null)
+      --arg brands "${AR_TITLE_BRANDS:-}" "$AR_JQ_CLEAN$AR_JQ_TASK"'
+      ($brands | brandmap) as $brand
+       | (.result.snapshot // .snapshot) as $s
+       | ($s.layouts // []) as $lay
+       | ($s.panes // []) as $pan
+       | {result:{tabs:[ $s.tabs[]? | .tab_id as $t
+           | (($lay | map(select(.tab_id == $t)) | .[0].focused_pane_id) // "") as $lp
+           | ($pan | map(select(.tab_id == $t and (.agent // "") != ""))) as $ag
+           | ( ($ag | map(select(.pane_id == $lp)) | .[0].pane_id)
+             # At work means not resting, so a status herdr adds later counts as
+             # interesting instead of dropping out of the rule silently.
+             // ($ag | map(select((.agent_status // "unknown") as $st
+                                  | $st != "idle" and $st != "done" and $st != "unknown"))
+                     | .[0].pane_id)
+             // $lp ) as $pick
+           | ($pan | map(select(.pane_id == $pick)) | .[0]) as $p
+           | ($p.terminal_title_stripped // $p.terminal_title
+              | taskof($brand; $p.agent)) as $ti
+           | (($p.foreground_cwd // $p.cwd) | clean) as $dir
+           | . + { _name_pane: $pick,
+                   _name_agent: ($p.agent | clean),
+                   _name_title: $ti,
+                   _name_title_lc: ($ti | ascii_downcase),
+                   _name_dir_lc: (($dir | split("/") | last) // "" | ascii_downcase),
+                   _name_dir: $dir,
+                   _name_session: ($p.agent_session.value | clean) } ]}}' 2>/dev/null)
     AR_SNAP_AGENTS_JSON=$(printf '%s' "$snap" | jq -c \
       '{result:{agents:((.result.snapshot // .snapshot).agents // [])}}' 2>/dev/null)
-    if [ "$need_panes" = "1" ]; then
+    # Lifted whatever the toggles say, because the workspace pass wants them as
+    # well (ar_workspace_pane_dirs) and the snapshot is already in hand: one jq
+    # over memory, no herdr call. The per-list path below still fetches only when
+    # tab naming needs it, since there a pane list is a round-trip.
+    if ar_ws_derives || [ "$AR_TAB_METADATA_OK" = "1" ]; then
       AR_PANES_JSON=$(printf '%s' "$snap" | jq -c \
         '{result:{panes:((.result.snapshot // .snapshot).panes // [])}}' 2>/dev/null)
       [ -n "$AR_PANES_JSON" ] || AR_PANES_JSON='{"result":{"panes":[]}}'
     fi
   else
+    ar_trace "per-list fallback: no usable api snapshot"
     wsjson=$("$HERDR" workspace list 2>/dev/null) || wsjson=""
-    if [ "$need_panes" = "1" ]; then
+    # The workspace pass wants the panes too, and wants them whatever NAME_TABS
+    # says: they are how a workspace herdr has not persisted yet is named at all,
+    # and how a rename the prompt just applied is told from one session.json is
+    # merely late in reporting. Here that is a round-trip rather than a jq over
+    # the snapshot, so it is still asked for only where a pass will read it.
+    if { ar_ws_derives && { [ "$NAME_TABS" = "1" ] || ar_ws_pass; }; } || [ "$AR_TAB_METADATA_OK" = "1" ]; then
       AR_PANES_JSON=$("$HERDR" pane list 2>/dev/null) || AR_PANES_JSON='{"result":{"panes":[]}}'
-      [ -n "$AR_PANES_JSON" ] || AR_PANES_JSON='{"result":{"panes":[]}}'
     fi
   fi
-  if [ "$AR_TAB_METADATA_OK" = "1" ] \
-     && { [ "$CLEAR" = "1" ] || [ "$AUTO_INDEX" != "1" ]; }; then
+  if [ "$AR_TAB_METADATA_OK" = "1" ] && { [ "$CLEAR" = "1" ] || ! ar_index_on tabs; }; then
     ar_clear_tab_number_tokens
   fi
-  if [ "$CLEAR" = "1" ] || [ "$AUTO_INDEX" = "1" ]; then
+  # ar_index_pass decides which of these have work to do (numbering, or the
+  # strip a named-and-off kind asks for). Tabs carry an extra arm because they
+  # are the only kind we NAME, so that pass runs whatever the numbering says.
+  if ar_ws_pass; then
     ar_renumber_workspaces "$wsjson"
   fi
-  if [ "$CLEAR" = "1" ] || [ "$AUTO_INDEX" = "1" ] || [ "$NAME_TABS" = "1" ]; then
+  if ar_index_pass tabs || [ "$NAME_TABS" = "1" ]; then
     AR_SEEN_TABS=""
     AR_TABS_PARTIAL=""
     ar_reconcile_tabs "$wsjson"
-    # Only a complete read can confirm a tab has closed. A later successful
-    # pass will prune records retained after a transient query failure.
-    [ "$NAME_TABS" = "1" ] && [ -n "$AR_SEEN_TABS" ] && [ -z "$AR_TABS_PARTIAL" ] \
+    # AR_SEEN_TABS is a space-joined list and ar_state_prune takes one tab id per
+    # argument, so the split is the call. herdr tab ids carry no whitespace.
+    # A pass that could not read every workspace's tabs prunes nothing: the tabs
+    # it did not see still exist, and dropping their records opts each one out
+    # for good. The next full read prunes what is really gone.
+    # shellcheck disable=SC2086
+    [ "$NAME_TABS" = "1" ] && [ -n "$AR_SEEN_TABS" ] && [ -z "${AR_TABS_PARTIAL:-}" ] \
       && ar_state_prune $AR_SEEN_TABS
   fi
-  if [ "$CLEAR" = "1" ] || [ "$AUTO_INDEX" = "1" ]; then
+  if ar_index_pass agents; then
     ar_renumber_agents
   fi
+  # The force was for this pass. ar_run can loop the reconcile when events land
+  # while it runs, and a tab still forced on a later loop is a tab whose opt-out
+  # check is still bypassed: rename it by hand inside that window and the next loop
+  # would take the name back instead of leaving it alone, which is the one promise
+  # this plugin makes. AR_FORCE_WAS_OUT and AR_FORCE_ADOPTED outlive it, because
+  # the action still has to report what happened.
+  AR_FORCE_TAB=""
 }
 
 # Fast path for the shell hooks: rename only the current tab (no cross-tab work).
-# Both hook modes pass the shell's cwd. preexec also passes the command line;
-# precmd classifies the result as a shell prompt. Preserves the existing "[N]"
-# prefix when AUTO_INDEX is on, drops it when off.
+# preexec passes the command line; precmd (back at the prompt) names by the shell.
+# Preserves the existing "[N]" prefix when tab numbering is on, drops it when off.
 #
 # preexec has two modes. Default: trust the command line's first word as the
 # program (accurate for external commands and expanded aliases). Sampled
 # (AR_FAST_SAMPLE=1, the hook classified the word as a shell construct --
 # function/builtin/reserved/typo): the word is NOT the program, so read the
 # pane's real foreground process instead. An instant construct has exited by
-# sample time (leader = the shell -> prompt label already current -> no rename, no
+# sample time (leader = the shell -> name already "zsh" -> no rename, no
 # flicker); a construct wrapping nvim samples as nvim. On sampling failure
 # rename nothing -- never guess.
 ar_fast_once() {
+  # The workspace goes first so the tab can dedupe against the name the
+  # workspace ends the prompt with. The other order leaves the tab repeating the
+  # workspace's own name (a tab reading "project-b > zsh" inside project-b) at
+  # every prompt until a full reconcile refreshes the base recorded on the tab.
+  #
+  # A cd has landed by the time the prompt is drawn, and preexec's $PWD is the
+  # one the last precmd already saw, so the workspace half is precmd's alone.
+  AR_FAST_WS=""
+  [ "$MODE" = "precmd" ] && ar_fast_workspace
+  [ "$NAME_TABS" = "1" ] && ar_fast_tab
+  return 0
+}
+
+# The tab half: rename the tab this shell is in, and nothing else.
+ar_fast_tab() {
   local tab="${HERDR_TAB_ID:-}"
-  [ -n "$tab" ] || return 0
-  local prog="" cmd="" cwd="${AR_FAST_CWD:-}" info name label raw prefix slabel want
+  ar_trace "fast tab entered: $MODE, tab [${tab}]"
+  [ -n "$tab" ] || { ar_trace "fast tab: no HERDR_TAB_ID"; return 0; }
+  local prog="" cmd="" info name label raw prefix slabel enabled auto want ws
+  local tag hosttag core
   if [ "$MODE" = "preexec" ]; then
     if [ "${AR_FAST_SAMPLE:-}" = "1" ]; then
-      info=$(ar_pane_program "${HERDR_PANE_ID:-}") || return 0
-      IFS=$'\t' read -r prog cmd <<< "$info"
-      [ -n "$prog" ] || return 0
-      # A sampled shell means the construct already finished without leaving a
-      # foreground program. Do nothing and let precmd own the prompt label. This
-      # is especially important for `cd`: this delayed worker carries preexec's
-      # old cwd and may finish after precmd has written the new one.
-      ar_in_list "$prog" "${SHELLS[@]}" && return 0
+      info=$(ar_pane_program "${HERDR_PANE_ID:-}") || { ar_trace "$tab sampling failed, nothing renamed"; return 0; }
+      ar_split_program "$info"
+      prog=$AR_PROG
+      cmd=$AR_CMD
+      # A delayed shell sample must not restore the directory from before cd.
+      if ar_in_list "$prog" "${SHELLS[@]}" || [ "$prog" = "$SHELL_NAME" ]; then return 0; fi
+      [ -n "$prog" ] || { ar_trace "$tab sampled no foreground program"; return 0; }
     else
       cmd="${AR_FAST_ARG:-}"
       prog="${cmd%% *}"; prog="${prog##*/}"
     fi
   fi
-  name=$(ar_format "$prog" "$cmd" "$cwd")
   # A failed `tab get` must NOT look like an empty label (which would read as a
   # placeholder and clobber a hand-picked name). Only proceed on a real tab object.
-  raw=$("$HERDR" tab get "$tab" 2>/dev/null) || return 0
-  [ -n "$raw" ] || return 0
-  printf '%s' "$raw" | jq -e '(.result.tab // .tab) | has("label")' >/dev/null 2>&1 || return 0
-  label=$(printf '%s' "$raw" | jq -r '(.result.tab // .tab).label // ""' 2>/dev/null)
+  raw=$("$HERDR" tab get "$tab" 2>/dev/null) || { ar_trace "$tab tab get failed"; return 0; }
+  [ -n "$raw" ] || { ar_trace "$tab tab get answered nothing"; return 0; }
+  printf '%s' "$raw" | jq -e '(.result.tab // .tab) | has("label")' >/dev/null 2>&1 || { ar_trace "$tab tab get carried no label field"; return 0; }
+  label=$(printf '%s' "$raw" | jq -r "$AR_JQ_CLEAN"'(.result.tab // .tab).label | clean' 2>/dev/null)
 
-  if [ "$AUTO_INDEX" = "1" ]; then prefix=$(ar_index_prefix "$label"); else prefix=""; fi
-  slabel=$(ar_strip_prefix "$label")
-  ar_name_eligible "$tab" "$slabel" || return 0
+  # The fast path knows the tab it runs in, not the position that tab holds,
+  # so a host tag can only be CARRIED from the label already on it; the
+  # reconcile settles adds and removes when a tab moves to or from the first
+  # slot. Without the carry, every command typed in the first tab would flash
+  # the tag off until the next herdr event put it back. The tag comes off into
+  # $core so the number and the eligibility base are read from what follows
+  # it, while $label keeps the full string for the final compare. The peel
+  # itself is gated exactly like the reconcile's (ar_tag_strip_ok): --clear,
+  # or a row the store says we tagged. That gate is what keeps a hand-typed
+  # host-looking name intact on any tab the store never tagged, and what lets
+  # a tagged tab heal after the knob went off instead of
+  # freezing on a label the opt-out machine would call the user's. The strip
+  # below $core also carries the residue cut, so a tag whose spelling changed
+  # since it was written comes off through the number behind it and the base
+  # still reads as ours.
+  tag=$(ar_host_tag)
+  hosttag=""
+  core=$label
+  if [ -n "$tag" ] && [ "$(ar_tag_strip_ok "$tab")" = "1" ]; then
+    case "$core" in
+      "$tag"*) core=${core#"$tag"}; [ "${HOST_PREFIX:-0}" = "1" ] && hosttag=$tag ;;
+    esac
+  fi
+  if ar_index_on tabs; then prefix=$(ar_index_prefix "$core"); else prefix=""; fi
+  slabel=$(ar_tab_strip_prefix "$core" "$(ar_tag_strip_ok "$tab")")
+  ar_name_eligible "$tab" "$slabel" || return 0   # it says why
+  # The context is this shell's own $PWD -- the hook backgrounds the engine from
+  # the pane, so the directory arrives for free and a cd shows up at the next
+  # prompt. The workspace it dedupes against is whatever the last reconcile
+  # recorded on the tab: reading it back costs nothing, where asking herdr would
+  # cost a socket round-trip on every command.
+  # The branch comes from this shell's own directory, so a checkout switched at
+  # the prompt shows up at the next one -- herdr has no event to tell us.
+  # AR_FAST_WS is what the workspace half just settled this workspace on, where
+  # it ran. The record on the tab is what the last reconcile saw, which a cd has
+  # by then moved out from under.
+  ws=${AR_FAST_WS:-${AR_STATE_WS:-}}
+  ar_branch_of "${AR_FAST_CWD:-$PWD}" >/dev/null
+  name=$(ar_label "${AR_FAST_CWD:-$PWD}" "$ws" "$AR_BRANCH" "$prog" "$cmd")
   # Empty is a real answer under HIDE_SHELL (name the tab nothing, keeping the
   # number alone when there is one); anywhere else it means we have no name.
   if [ -z "$name" ]; then
-    [ "${HIDE_SHELL:-0}" = "1" ] || return 0
+    [ "${HIDE_SHELL:-0}" = "1" ] || { ar_trace "$tab no name computed for [$prog]"; return 0; }
     prefix="${prefix% }"                        # "[3] " -> "[3]", "" stays ""
   fi
-  want="${prefix}${name}"
-  ar_rename_owned_tab "$tab" "$name" "$label" "$want" || return 0
+  want="${hosttag}${prefix}${name}"
+  local tagged=0
+  [ -n "$hosttag" ] && tagged=1
+  ar_rename_owned_tab "$tab" "$name" "$label" "$want" "$ws" "$tagged"
+
+}
+
+# The workspace half: keep the workspace's own label on the directory the shell
+# is standing in. herdr emits no event for a cd, so the label sat on the
+# directory the workspace was created in until an unrelated event arrived, while
+# the tab beside it followed every prompt (issue #20). The rules are the pass's
+# own: the base is herdr's derivation of the directory (ar_project_base), and
+# ownership decides whether it may be applied (ar_ws_track_eligible).
+#
+# A quiet prompt costs one state read and no herdr call at all. The base we own
+# is in the state file, so a prompt that derives the same base again stops
+# there, and only a cd that leaves the project reaches `workspace list`. A
+# workspace nobody has adopted, or one somebody named by hand, stops there too:
+# adopting one takes its label, and fetching that on every prompt is the cost
+# this guard exists to refuse. The reconcile adopts it at the next herdr event.
+ar_fast_workspace() {
+  local tab="${HERDR_TAB_ID:-}" wid base shown json label owner active slabel prefix want
+  local enabled auto unused seeded
+  ar_trace "fast workspace entered: tab [${tab}]"
+  ar_ws_pass || { ar_trace "fast workspace: workspace pass is off"; return 0; }
+  # A herdr tab id carries its workspace and a colon ("w1:t1"), the same shape
+  # the "ws:" state keys are built to sit beside without colliding. No colon, no
+  # workspace to name from here.
+  case "$tab" in *:*) wid=${tab%%:*} ;; *) ar_trace "fast workspace: tab id [$tab] names no workspace"; return 0 ;; esac
+  [ -n "$wid" ] || { ar_trace "fast workspace: tab id [$tab] names no workspace"; return 0; }
+  base=$(ar_project_base "${AR_FAST_CWD:-$PWD}")
+  [ -n "$base" ] || { ar_trace "ws:$wid no project base for $PWD"; return 0; }
+  # What the sidebar would read, which is what the record below is compared
+  # against. Comparing the DERIVED name instead would make the guard false on
+  # every prompt for as long as a rewrite rule matches this workspace, and the
+  # `workspace list` this guard exists to refuse would run on every one of them.
+  shown=$(ar_ws_subst "$base")
+  # A rule that outputs nothing, or one `sed` rejects outright (a typo, a
+  # GNU-only construct on BSD sed), leaves this empty, and an empty label is one
+  # herdr would take: the row goes blank and its derivation is frozen by the
+  # rename that blanked it. The reconcile half refuses an empty base for the
+  # same reason a few lines into its loop, and the tab half refuses an empty
+  # name unless HIDE_SHELL asked for one.
+  [ -n "$shown" ] || { ar_trace "ws:$wid rewrite of [$base] is empty, nothing renamed"; return 0; }
+  ar_state_rows
+  # Every field gets a name, for the reason ar_ws_track_eligible names them all.
+  # shellcheck disable=SC2034  # `unused` and `seeded` are named so they can be discarded
+  IFS=$AR_ROW_SEP read -r enabled auto unused seeded <<< "$(ar_state_fields "ws:$wid")"
+  [ "$enabled" = "true" ] && [ -n "$auto" ] && [ "$auto" != "$shown" ] || { ar_trace "ws:$wid quiet prompt: not owned, or base already [$shown]"; return 0; }
+  json=$("$HERDR" workspace list 2>/dev/null) || { ar_trace "ws:$wid workspace list failed"; return 0; }
+  # Two things come back beside the label. The row's own active tab, because a
+  # prompt says where the WORKSPACE is only when it is drawn where the workspace
+  # is: herdr moves identity_cwd with the active pane, so a prompt in a
+  # background tab, which is what a long command finishing after focus moved
+  # produces, would rename the workspace away from where the user is standing.
+  # And whichever workspace claims THIS tab as its active one, because a tab
+  # dragged between workspaces keeps the id it was created with, so the id's own
+  # prefix can name the workspace the tab has left.
+  #
+  # A herdr that reports no active tab anywhere is trusted as before, since
+  # refusing every prompt is the worse half of that guess. The label goes LAST:
+  # bash hands the last name the rest of the line, and the label is the field
+  # that can hold anything.
+  IFS=$AR_ROW_SEP read -r owner active label <<< "$(printf '%s' "$json" \
+    | jq -r --arg w "$wid" --arg t "$tab" "$AR_JQ_CLEAN"'
+      [ (.result.workspaces // .workspaces // [])[] ] as $ws
+      | ( [ $ws[] | select((.active_tab_id | clean) == $t) ] | .[0] ) as $owner
+      | $ws[] | select((.workspace_id | clean) == $w)
+      | [ (($owner.workspace_id // "") | clean), (.active_tab_id | clean),
+          (.label | clean) ] | join([31] | implode)' 2>/dev/null)"
+  [ -n "$label" ] || { ar_trace "ws:$wid not in the workspace list"; return 0; }
+  if [ -n "$active" ]; then
+    [ "$active" = "$tab" ] || { ar_trace "ws:$wid prompt is not in its active tab ($active)"; return 0; }
+  else
+    [ -z "$owner" ] || [ "$owner" = "$wid" ] || { ar_trace "ws:$wid tab [$tab] is active in $owner instead"; return 0; }
+  fi
+  slabel=$(ar_strip_prefix "$label")
+  ar_ws_track_eligible "$wid" "$slabel" "$base" || { ar_trace "ws:$wid not eligible: label [$slabel]"; return 0; }
+  # The position is the reconcile's to compute, so the number already on the row
+  # is carried forward, the way the tab half carries its own.
+  # Whether the number on this row survives the prompt is the reconcile's rule,
+  # and this half has to answer it the same way or the two undo each other every
+  # time: numbering on carries it, numbering NAMED and switched off strips it
+  # (that strip is what naming the kind asks for), and a config that merely
+  # inherited off has asked for neither and is left as it is -- which is the
+  # case rewrite rules made reachable here. The prefix is taken back off the
+  # label rather than rebuilt from it, for the reason ar_renumber_workspaces
+  # gives where it does the same.
+  if ar_index_on workspaces || ! ar_index_pass workspaces; then
+    prefix=${label%"$slabel"}
+  else
+    prefix=""
+  fi
+  want="$prefix$shown"
+  if [ "$want" != "$label" ]; then
+    "$HERDR" workspace rename "$wid" "$want" >/dev/null 2>&1 || { ar_trace "ws:$wid rename failed: [$want]"; return 0; }
+    ar_trace "ws:$wid rename issued: [$label] -> [$want]"
+  fi
+  # What the workspace is called after this prompt, for the tab half to dedupe
+  # against -- the same handover ar_renumber_workspaces makes through AR_WS_BASES,
+  # and the derived name for the same reason: a rewrite is the sidebar's, and a
+  # tab still sits in a directory called what the directory is called.
+  AR_FAST_WS=$base
+  ar_ws_claim "$wid" "$shown"
 }
 
 # Coalesce bursts: only the lock holder works; contenders raise the rerun flag
@@ -1010,12 +2824,36 @@ ar_fast_once() {
 # is a superset of the single-tab rename, so a structural event that raced a
 # preexec is still handled (and its lost rename recovered) inside this loop.
 ar_run() {
-  local want="${1:-full}"
-  ar_lock || { : > "$RERUN_FLAG" 2>/dev/null || true; exit 0; }
+  local want="${1:-full}" mode="${2:-event}" tries=0
+  while ! ar_lock; do
+    # An EVENT can defer: raising the rerun flag makes whoever holds the lock do
+    # this work too, and every pass computes the same thing. An ACTION cannot. Its
+    # request lives in this process (AR_FORCE_TAB, CLEAR), so handing the job over
+    # would drop it silently -- a reset pressed during a burst of events did
+    # nothing at all, and said nothing either, since exiting here never reached the
+    # notification. So it waits for its turn, and gives up rather than hanging.
+    if [ "$mode" != "action" ]; then
+      : > "$RERUN_FLAG" 2>/dev/null || true
+      ar_trace "lock held elsewhere, rerun flag raised, deferred"
+      exit 0
+    fi
+    tries=$(( tries + 1 ))
+    [ "$tries" -ge 20 ] && { ar_trace "lock wait timed out for the action"; return 1; }   # ~2s, where a pass runs in well under one
+    sleep 0.1 2>/dev/null || return 1
+  done
   trap 'ar_unlock' EXIT
+  if [ "${NAME_TABS:-1}" = "1" ] && [ "${CLEAR:-0}" != "1" ]; then
+    ar_state_seed || return 1
+  fi
+  ar_trace "lock acquired: $mode $want pass"
   local guard=0
   while :; do
     rm -f "$RERUN_FLAG" 2>/dev/null || true
+    # The state rows are loaded once per PASS, not per process: the lock is let
+    # go and retaken between two turns of this loop, and whoever held it in
+    # between wrote to the file this process would otherwise still be reading
+    # from memory.
+    AR_STATE_ROWS_LOADED=""
     if [ "$want" = "fast" ]; then ar_fast_once; else ar_reconcile; fi
     want=full                              # any re-pass is a full reconcile
     guard=$(( guard + 1 ))
@@ -1036,18 +2874,51 @@ ar_run() {
 ar_main() {
   set -o pipefail
 
-  command -v jq >/dev/null 2>&1 || exit 0
-  command -v "$HERDR" >/dev/null 2>&1 || exit 0
-  mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
+  # Silent by default, as ever: a hook fires these on every prompt. Tracing is
+  # not available yet (the state dir may be what is missing), so with AR_TRACE
+  # set the reason goes out as a notification instead of into the file.
+  # A prerequisite that is missing ends the run quietly, as it always has, with
+  # two exceptions: a doctor run prints why on stdout, since that is the one
+  # mode whose whole job is to say what is wrong, and a traced run notifies.
+  ar_prereq_fail() {
+    [ "${1:-}" = "doctor" ] && printf 'doctor: %s\n' "$2"
+    [ -n "${AR_TRACE:-}" ] && ar_notify "herdr-automatic-rename" "$2"
+    exit 0
+  }
+  command -v jq >/dev/null 2>&1 || ar_prereq_fail "${1:-}" "jq not found"
+  command -v "$HERDR" >/dev/null 2>&1 || ar_prereq_fail "${1:-}" "herdr not found: $HERDR"
+  mkdir -p "$STATE_DIR" 2>/dev/null || ar_prereq_fail "${1:-}" "cannot create $STATE_DIR"
 
   # Config overrides must load BEFORE naming.sh (its defaults only fill unset vars).
+  # The config path is the user's, resolved at runtime, so shellcheck has no file
+  # to read here.
+  # shellcheck source=/dev/null
   [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+  # shellcheck source=naming.sh
   . "$AR_ROOT/naming.sh"
+  # The one module that reads the filesystem. Sourced beside naming.sh rather
+  # than from it, which keeps that file's string-in / string-out contract.
+  # shellcheck source=git.sh
+  . "$AR_ROOT/git.sh"
+  # shellcheck source=transcript.sh
+  . "$AR_ROOT/transcript.sh"
+  # shellcheck source=fork-metadata.sh
+  . "$AR_ROOT/fork-metadata.sh"
 
-  # Feature toggles (default on). A config value of 0 wins because := only fills
-  # an unset/empty var.
+  # TITLE_BRANDS as one argument for the two title lifts, joined here so neither
+  # pays for it per pane. Both look a brand up by the pane's agent kind, and the
+  # snapshot lift reshapes every tab in one jq, so the lookup cannot be done out
+  # here. printf -v rather than a command substitution because this runs on every
+  # event and every shell hook, and the fast path never lifts a title at all: a
+  # fork for a value it throws away is the one cost the hook path cannot amortize.
+  # An empty list leaves a lone newline, which brandmap reads as no entries.
+  printf -v AR_TITLE_BRANDS '%s\n' "${TITLE_BRANDS[@]}"
+
+  # Naming toggle (default on). A config value of 0 wins because := only fills
+  # an unset/empty var. Numbering needs nothing here: AUTO_INDEX, the per-kind
+  # overrides and their shared default are read straight from the config by
+  # ar_index_on and ar_index_explicit.
   : "${NAME_TABS:=1}"
-  : "${AUTO_INDEX:=1}"
 
   MODE="${1:-event}"
   CLEAR=0
@@ -1057,32 +2928,30 @@ ar_main() {
     preexec)
       [ "$NAME_TABS" = "1" ] || exit 0
       AR_FAST_ARG="${2:-}"                    # the command line being run
-      AR_FAST_CWD=""
-      # New callers pass cwd as $3 and the optional "shell" marker as $4. Keep
-      # accepting the legacy `preexec <cmdline> shell` form with no cwd.
-      if [ "${3:-}" = "shell" ] && [ -z "${4:-}" ]; then
-        AR_FAST_SAMPLE=1
-      else
-        AR_FAST_CWD="${3:-}"
-        [ "${4:-}" = "shell" ] && AR_FAST_SAMPLE=1
-      fi
-      # "shell" means the hook resolved the command word to a shell construct
+      # $3 = "shell": the hook resolved the command word to a shell construct
       # (function/builtin/reserved/typo), which never becomes the foreground
       # process. Give the construct a moment to finish or spawn its real
       # program, then name by what actually holds the pane (see ar_fast_once).
       # The settle sleep runs BEFORE ar_run so the lock is never held asleep.
-      if [ "${AR_FAST_SAMPLE:-}" = "1" ]; then
+      AR_FAST_CWD=${3:-$PWD}
+      [ "${3:-}" = "shell" ] && AR_FAST_CWD=$PWD
+      if [ "${3:-}" = "shell" ] || [ "${4:-}" = "shell" ]; then
+        AR_FAST_SAMPLE=1
         sleep 0.2 2>/dev/null || true
       fi
       ar_run fast
       ;;
     precmd)
-      [ "$NAME_TABS" = "1" ] || exit 0
-      # Optional $2 is the calling shell's own name, and optional $3 is its cwd.
-      # An older caller can omit either; then the formatter keeps its configured
-      # shell label and/or simply has no cwd component.
+      # The workspace half runs whether or not tabs are named: which knobs govern
+      # a workspace label are the workspace's own (see ar_fast_workspace).
+      { [ "$NAME_TABS" = "1" ] || ar_ws_pass; } || exit 0
+      # Optional 2nd arg = the calling shell's own name, so a bare prompt in a
+      # bash/fish pane reads "bash"/"fish" instead of $SHELL (the login shell).
+      # Absent (a bare `precmd` from an older caller) -> keep the SHELL_NAME
+      # default from naming.sh/config. ar_format returns SHELL_NAME for an empty
+      # program, which is exactly the bare-prompt case the precmd fast path hits.
       [ -n "${2:-}" ] && SHELL_NAME="$2"
-      AR_FAST_CWD="${3:-}"
+      AR_FAST_CWD=${3:-$PWD}
       ar_run fast
       ;;
     reset)
@@ -1098,21 +2967,78 @@ ar_main() {
           | jq -r 'first((.result.tabs // .tabs)[] | select(.focused) | .tab_id) // empty' 2>/dev/null)
       fi
       [ -n "$tab" ] && [ "$NAME_TABS" = "1" ] && AR_FORCE_TAB="$tab"
-      ar_run full
+      if ! ar_run full action; then
+        ar_notify "Reset is waiting" "Another naming pass held the lock. Try again."
+        exit 0
+      fi
+      # Two facts, both from the pass that just ran: the tab HAD opted out
+      # (AR_FORCE_WAS_OUT, read before its state was cleared) and it is named and
+      # owned again (AR_FORCE_ADOPTED, set where that claim is recorded). Only both
+      # together are a re-adoption. Either alone is worth saying out loud, because
+      # a keybinding has nothing else to report with.
+      if [ -n "${AR_FORCE_WAS_OUT:-}" ] && [ -n "${AR_FORCE_ADOPTED:-}" ]; then
+        ar_notify "Tab re-adopted" "Automatic naming is on for this tab again."
+      elif [ -n "${AR_FORCE_WAS_OUT:-}" ]; then
+        ar_notify "Reset did not take" "That tab had opted out, but the rename did not land."
+      elif [ "$NAME_TABS" != "1" ]; then
+        ar_notify "Nothing to reset" "Tab naming is off (NAME_TABS=0)."
+      elif [ -n "${AR_FORCE_ADOPTED:-}" ]; then
+        ar_notify "Nothing to reset" "That tab was already named automatically."
+      else
+        ar_notify "Nothing to reset" "No tab to re-adopt."
+      fi
+      ;;
+    doctor)
+      # Same three-step tab resolution as reset. Then one REAL pass, traced into
+      # a file of its own so a user's AR_TRACE_FILE is not written to, and the
+      # report reads that file. The pass runs whether or not a tab resolved,
+      # because "nothing is named at all" is the other question doctor answers.
+      tab="${HERDR_TAB_ID:-}"
+      if [ -z "$tab" ] && [ -n "${HERDR_PLUGIN_CONTEXT_JSON:-}" ]; then
+        tab=$(printf '%s' "$HERDR_PLUGIN_CONTEXT_JSON" \
+          | jq -r '.tab.tab_id // .tab.id // .tab_id // empty' 2>/dev/null)
+      fi
+      if [ -z "$tab" ]; then
+        tab=$("$HERDR" tab list 2>/dev/null \
+          | jq -r 'first((.result.tabs // .tabs)[] | select(.focused) | .tab_id) // empty' 2>/dev/null)
+      fi
+      AR_TRACE=1
+      AR_TRACE_FILE=$(mktemp "$STATE_DIR/.doctor.XXXXXX") || exit 0
+      # No pass, no report: reading the old state and label as if a pass had just
+      # run is the parallel computation ar_doctor exists to avoid. Same message
+      # as reset and clear give when the lock is held.
+      if ! ar_run full action >/dev/null 2>&1; then
+        printf 'doctor: another naming pass held the lock, so no pass ran. Try again.\n'
+        ar_notify "Doctor is waiting" "Another naming pass held the lock. Try again."
+        rm -f "$AR_TRACE_FILE"
+        exit 0
+      fi
+      ar_doctor "$tab"
+      rm -f "$AR_TRACE_FILE"
       ;;
     clear|--clear)
-      ar_run full                            # CLEAR=1 already set above
-      ;;
-    tab.renamed)
-      # Every automatic tab rename emits this event. If the current base still
-      # matches our recorded auto-name, it is our own idempotent notification,
-      # not a manual edit, and a full reconcile can only add latency (or replace
-      # a fresh hook-provided cwd with Herdr's temporarily stale foreground_cwd).
-      ar_tab_rename_is_owned "${HERDR_TAB_ID:-}" || ar_run full
+      if ar_run full action; then            # CLEAR=1 already set above
+        ar_notify "Number prefixes cleared" "Base names restored, agents back to detection."
+      else
+        ar_notify "Clear is waiting" "Another naming pass held the lock. Try again."
+      fi
       ;;
     tab.closed)
       ar_wait_tab_gone "${HERDR_TAB_ID:-}"   # settle before the reconcile
       ar_run full                            # renumbers survivors; ar_state_prune drops the closed tab
+      ;;
+    tab.renamed)
+      # Our own rename re-fires this event. When state already says we own the
+      # tab at exactly the label it now carries, the reconcile would find every
+      # number correct and change nothing, so it is skipped before the lock:
+      # every pass that renamed something used to be followed by a second full
+      # pass that did nothing. Anything else, a hand rename included, falls
+      # through to the full pass. With no tab id there is nothing to check.
+      if [ -n "${HERDR_TAB_ID:-}" ] && [ "$NAME_TABS" = "1" ] \
+         && ar_own_rename "$HERDR_TAB_ID"; then
+        exit 0
+      fi
+      ar_run full
       ;;
     *)
       ar_run full                            # any other herdr event

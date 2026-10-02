@@ -1,0 +1,53 @@
+# Publish a GitHub Release when a version tag is pushed.
+#
+# A tag on its own creates no Release, which is how v0.7.2 and v0.7.3 came to
+# have none. The notes are the matching CHANGELOG section rather than anything
+# written here, so the Release and the changelog cannot drift apart.
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # The section runs from this version's heading to the next one. A tag
+      # whose version has no entry fails the job: an empty Release says less
+      # than no Release, and it is the changelog that wants fixing.
+      - name: Take the notes out of the changelog
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            $0 == "## [" v "]" || index($0, "## [" v "] ") == 1 { found = 1; next }
+            /^## \[/ { found = 0 }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          # Trim the blank lines the split leaves at either end.
+          awk 'NF || seen { print; seen = 1 }' notes.md \
+            | awk '{ line[NR] = $0 } END { while (NR > 0 && line[NR] == "") NR--; for (i = 1; i <= NR; i++) print line[i] }' \
+            > notes.trimmed && mv notes.trimmed notes.md
+          if [ ! -s notes.md ]; then
+            echo "No '## [$version]' section in CHANGELOG.md" >&2
+            exit 1
+          fi
+          echo "Release notes for $version:" && cat notes.md
+
+      # Updating rather than failing when the Release is already there, because
+      # a tag that had to be moved (a bad author, a squash) re-runs this job.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md
+          fi

@@ -15,10 +15,7 @@
 # individual list commands above -- both paths stay covered.
 #
 # Mutating commands (the whole point of the test) are appended verbatim to
-# $HERDR_MOCK_LOG so the test can assert exactly which renames and metadata
-# reports the engine issued.
-# Fault marker fixtures workspaces.fail / tabs_<id>.fail reject list reads;
-# tab_rename.fail rejects a logged rename attempt.
+# $HERDR_MOCK_LOG so the test can assert exactly which renames the engine issued.
 # A missing query fixture yields a valid-but-empty result so the engine degrades
 # the same way it would against a real herdr that returned nothing.
 
@@ -29,6 +26,14 @@ serve() { cat "$dir/$1" 2>/dev/null || printf '%s' "$2"; }
 
 group="$1"; shift 2>/dev/null || true
 action="$1"; shift 2>/dev/null || true
+
+# $HERDR_MOCK_FAIL_VERB="tab list" (or any "<group> <action>") makes that one
+# query exit 1 with no output, standing in for a socket blip mid-pass. Naming
+# the arguments too ("tab list --workspace w2") fails only that call, which is
+# how a pass reads one workspace and loses the other.
+case "$group $action $*" in
+  "${HERDR_MOCK_FAIL_VERB:-}"|"${HERDR_MOCK_FAIL_VERB:-} "*) [ -n "${HERDR_MOCK_FAIL_VERB:-}" ] && exit 1 ;;
+esac
 
 case "$group" in
   # $HERDR_MOCK_VERSION picks the herdr the engine thinks it is talking to, which
@@ -42,20 +47,52 @@ case "$group" in
     exit 0 ;;
   workspace)
     case "$action" in
-      list)   [ -e "$dir/workspaces.fail" ] && exit 1
-              serve workspaces.json '{"result":{"workspaces":[]}}' ;;
-      rename) printf 'workspace rename %s %s\n' "$1" "$2" >>"$log" ;;
+      list)   serve workspaces.json '{"result":{"workspaces":[]}}' ;;
+      # $HERDR_MOCK_FAIL_RENAME=1 rejects this the way it rejects a tab rename
+      # (see below): logged, then non-zero, so a test can tell an attempted
+      # rename from a landed one.
+      rename) printf 'workspace rename %s %s\n' "$1" "$2" >>"$log"
+              [ "${HERDR_MOCK_FAIL_RENAME:-0}" = "1" ] && exit 1 ;;
     esac ;;
   tab)
     case "$action" in
       list)
         w=""
         while [ $# -gt 0 ]; do case "$1" in --workspace) w="$2"; shift 2 ;; *) shift ;; esac; done
-        [ -e "$dir/tabs_$w.fail" ] && exit 1
         serve "tabs_$w.json" '{"result":{"tabs":[]}}' ;;
-      get)    serve "tab_$1.json" '{}' ;;
+      # $HERDR_MOCK_TAB_GONE_AFTER=N: the first N `tab get` calls serve the
+      # fixture, every later one answers {} (the tab has left herdr's model). A
+      # counter file beside the log remembers across processes, and doubles as
+      # the record of how many polls the engine's close wait made.
+      get)
+        if [ -n "${HERDR_MOCK_TAB_GONE_AFTER:-}" ]; then
+          n=$(cat "$log.tabget" 2>/dev/null || echo 0); n=$(( n + 1 )); printf '%s' "$n" >"$log.tabget"
+          [ "$n" -gt "$HERDR_MOCK_TAB_GONE_AFTER" ] && { printf '{}'; exit 0; }
+        fi
+        serve "tab_$1.json" '{}' ;;
+      # $HERDR_MOCK_FAIL_RENAME=1 stands in for a herdr that REJECTS the rename
+      # (an invalid label, a socket blip): the attempt is still logged, so a test
+      # can assert it was issued, and the command then fails so the engine sees a
+      # non-zero status. Unset (the default) always succeeds, as a real rename
+      # normally does.
+      # $HERDR_MOCK_RERUN_ONCE holds a path: the first rename touches it and then
+      # forgets it. That is a herdr event landing WHILE a pass runs, which is the
+      # only way to make ar_run take its coalescing loop a second time -- the loop
+      # clears the flag when it starts, so a test cannot raise it beforehand.
       rename) printf 'tab rename %s %s\n' "$1" "$2" >>"$log"
-              [ -e "$dir/tab_rename.fail" ] && exit 1 ;;
+              # Once means once: the unset would only apply inside this child, so
+              # a marker file next to the flag is what remembers.
+              if [ -n "${HERDR_MOCK_RERUN_ONCE:-}" ] && [ ! -f "$HERDR_MOCK_RERUN_ONCE.done" ]; then
+                : >"$HERDR_MOCK_RERUN_ONCE" 2>/dev/null || true
+                : >"$HERDR_MOCK_RERUN_ONCE.done" 2>/dev/null || true
+              fi
+              [ "${HERDR_MOCK_FAIL_RENAME:-0}" = "1" ] && exit 1 ;;
+    esac ;;
+  notification)
+    # The two actions notify when they finish. Logged like any other mutating
+    # command so a scenario can assert what the user was told.
+    case "$action" in
+      show) printf 'notification show %s\n' "$*" >>"$log" ;;
     esac ;;
   pane)
     case "$action" in
@@ -64,10 +101,6 @@ case "$group" in
         p=""
         while [ $# -gt 0 ]; do case "$1" in --pane) p="$2"; shift 2 ;; *) shift ;; esac; done
         serve "procinfo_$p.json" '{}' ;;
-      report-metadata)
-        printf 'pane report-metadata' >>"$log"
-        for arg in "$@"; do printf ' %s' "$arg" >>"$log"; done
-        printf '\n' >>"$log" ;;
     esac ;;
   agent)
     case "$action" in

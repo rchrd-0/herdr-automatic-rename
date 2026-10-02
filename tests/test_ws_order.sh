@@ -4,15 +4,17 @@
 # alt+N (switch_workspace) resolves through herdr's visible workspace order, so
 # every rule that decides which rows the sidebar renders decides our numbers too:
 # which worktree workspaces group into a space, which member heads the group, and
-# which members a COLLAPSED space hides. Collapse lives only in herdr's
-# session.json, which the engine reads next to $HERDR_SOCKET_PATH -- so these
-# scenarios point that variable at a sandbox session file.
+# which members a COLLAPSED space hides. Collapse lives on disk, in the client
+# preference file herdr 0.9.0 keeps beside its other per-client state (and in
+# session.json below 0.9.0) -- so these scenarios point $HERDR_SOCKET_PATH and
+# $XDG_STATE_HOME at a sandbox and write the file herdr would have written.
 #
-# Reference (herdr src/ui/sidebar.rs workspace_list_entries_inner +
-# src/app/actions.rs visible_workspace_order/workspace_at_visible_position).
+# Reference (herdr 0.9.0 src/client/shell/sidebar.rs workspace_entries +
+# src/client/shell/actions.rs KeybindAction::SwitchWorkspace).
 
 set -o pipefail
 here=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=tests/lib.sh
 . "$here/lib.sh"
 
 ENGINE="$here/../automatic-rename.sh"
@@ -25,9 +27,10 @@ chmod +x "$MOCK" 2>/dev/null || true
 # directly. One repo with a main checkout and one linked worktree, then a plain
 # workspace, is the smallest shape that shows every rule.
 # ======================================================================
+# shellcheck source=automatic-rename.sh
 . "$ENGINE"
 
-positions() { ar_workspace_positions "$1" "$2" | tr '\t' ' ' | tr '\n' '|'; }
+positions() { ar_workspace_positions "$1" "$2" | tr '\037' ' ' | tr '\n' '|'; }
 
 WS='{"result":{"workspaces":[
   {"workspace_id":"wA","label":"main","focused":false,
@@ -65,8 +68,21 @@ setup() {
   export NAME_TABS=0 AUTO_INDEX=1
 }
 fixture() { cat >"$HERDR_MOCK_DIR/$1"; }
-# collapsed <json-array>  -- write the session file herdr would have persisted.
-collapsed() { printf '{"version":7,"collapsed_space_keys":%s,"workspaces":[]}\n' "$1" >"$SB/session.json"; }
+# collapsed <json-array>  -- write the client preference file herdr 0.9.0 keeps
+# collapse in. The path is the engine's own derivation, so a change to it that
+# stopped matching herdr would break these scenarios rather than pass quietly.
+collapsed() {
+  local f
+  f=$(ar_herdr_client_prefs)
+  mkdir -p "${f%/*}"
+  printf '{"sidebar_width":26,"collapsed_groups":%s}\n' "$1" >"$f"
+}
+# collapsed_legacy <json-array>  -- the same answer from where herdr below 0.9.0
+# kept it, with no client file present.
+collapsed_legacy() {
+  rm -f "$(ar_herdr_client_prefs)"
+  printf '{"version":7,"collapsed_space_keys":%s,"workspaces":[]}\n' "$1" >"$SB/session.json"
+}
 run_event() { /usr/bin/env bash "$ENGINE" "$1"; }
 log() { cat "$HERDR_MOCK_LOG"; }
 teardown() { rm -rf "$SB" 2>/dev/null || true; }
@@ -143,14 +159,46 @@ check_absent "expanded: no renames needed" "$out" "workspace rename"
 teardown
 
 # ======================================================================
-# Scenario 4: no session file (a herdr too old to persist collapse, or a
-#   --no-session run) degrades to "everything expanded".
+# Scenario 4: neither file present (a herdr too old to persist collapse at all,
+#   or a client that has never collapsed anything) degrades to "everything
+#   expanded", which is what the plugin did before it read collapse.
 # ======================================================================
 setup
 fixture_bug_shape true false
 run_event tab.focused
 out=$(log)
-check_absent "no session file: assume expanded" "$out" "workspace rename"
+check_absent "no collapse on disk: assume expanded" "$out" "workspace rename"
+teardown
+
+# ======================================================================
+# Scenario 4b: below herdr 0.9.0 the server kept collapse in session.json and
+#   wrote no client file, so the same collapse has to reach the numbers from
+#   there. The file that is present picks the source, not a version test.
+# ======================================================================
+setup
+fixture_bug_shape true false
+collapsed_legacy "[\"$MONO\"]"
+run_event tab.focused
+out=$(log)
+check_contains "legacy: hidden member bare"      "$out" "workspace rename w3 fh-9183"
+check_contains "legacy: next ws moves to [3]"    "$out" "workspace rename w5 [3] focusbeacon"
+teardown
+
+# ======================================================================
+# Scenario 4c: on 0.9.0 the server writes an empty collapsed_space_keys whatever
+#   the sidebar shows, so a session.json saying "nothing collapsed" must not
+#   overrule the client file that says otherwise. This is the shape the numbers
+#   went stale in: reading the server's copy answered "expanded" for every
+#   collapsed space.
+# ======================================================================
+setup
+fixture_bug_shape true false
+printf '{"version":7,"collapsed_space_keys":[],"workspaces":[]}\n' >"$SB/session.json"
+collapsed "[\"$MONO\"]"
+run_event tab.focused
+out=$(log)
+check_contains "client file wins: hidden member bare"   "$out" "workspace rename w3 fh-9183"
+check_contains "client file wins: next ws moves to [3]" "$out" "workspace rename w5 [3] focusbeacon"
 teardown
 
 # ======================================================================

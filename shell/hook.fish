@@ -3,8 +3,8 @@
 # herdr has no "foreground command changed" event, so this hook drives the
 # real-time updates via fish's native events: fish_preexec fires right before a
 # command runs (with the command line in $argv[1]), fish_postexec fires when
-# back at the prompt and passes the new cwd. Everything else (tab switches,
-# numbering, agents) comes from the plugin's herdr [[events]].
+# back at the prompt. Everything else (tab switches, numbering, agents) comes
+# from the plugin's herdr [[events]].
 #
 # Source this from your fish config (~/.config/fish/config.fish):
 #   source /path/to/herdr-automatic-rename/shell/hook.fish
@@ -32,17 +32,17 @@ if test -n "$HERDR_PANE_ID"; and test -x "$_har_bin"
         set -l word (string split -m 1 ' ' -- $argv[1])[1]
         set -l kind (type --type -- $word 2>/dev/null)
         if test "$kind" = file
-            command "$_har_bin" preexec "$argv[1]" "$PWD" >/dev/null 2>&1 &
+            command "$_har_bin" preexec "$argv[1]" >/dev/null 2>&1 &
         else
-            command "$_har_bin" preexec "$argv[1]" "$PWD" shell >/dev/null 2>&1 &
+            command "$_har_bin" preexec "$argv[1]" shell >/dev/null 2>&1 &
         end
         disown 2>/dev/null
     end
 
-    # postexec (back at the prompt): pass the current $PWD and "fish" so the
-    # formatter can show the directory while still classifying this as a shell.
+    # postexec (back at the prompt): name the tab after the shell ("fish") so a
+    # bare prompt reads "fish" regardless of the login shell.
     function _har_precmd --on-event fish_postexec
-        command "$_har_bin" precmd fish "$PWD" >/dev/null 2>&1 &
+        command "$_har_bin" precmd fish >/dev/null 2>&1 &
         disown 2>/dev/null
     end
 end

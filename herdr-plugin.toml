@@ -1,13 +1,14 @@
 id = "herdr-automatic-rename"
 name = "Herdr Automatic Rename"
-version = "0.4.0"
-# Stays at 0.7.1 deliberately. A requirement above the running herdr is a HARD
-# load failure (plugin_requires_newer_herdr), re-checked on every event dispatch,
-# whereas an event name an older herdr does not know is only an install-preview
-# warning. Newer-herdr features are therefore version-gated at runtime instead
-# (see ar_agent_prefix_ok) and newer events are simply declared below.
+version = "0.13.0"
+# min_herdr_version stays at 0.7.1 deliberately. A requirement above the running
+# herdr is a HARD load failure (plugin_requires_newer_herdr), re-checked on every
+# event dispatch, whereas an event name an older herdr does not know is only an
+# install-preview warning. Newer-herdr features are therefore version-gated at
+# runtime instead (see ar_agent_prefix_ok) and newer events are simply declared
+# below.
 min_herdr_version = "0.7.1"
-description = "Auto-name tabs after the foreground program and/or prefix workspaces, tabs, and agents with their 1-9 jump-key number. Each feature toggles via config.sh."
+description = "Auto-name tabs after where the work is and what is running there -- the directory, the branch, the machine reached over ssh, then the program or the task an agent reports -- and/or prefix workspaces, tabs, and agents with their 1-9 jump-key number. Each feature toggles via config.sh."
 platforms = ["linux", "macos"]
 
 # One unified reconcile handles both features, so every event runs the SAME
@@ -81,10 +82,8 @@ command = ["bash", "automatic-rename.sh", "tab.created"]
 on = "tab.closed"
 command = ["bash", "automatic-rename.sh", "tab.closed"]
 
-# Re-apply on a user rename (alt+r). Our own rename also re-fires this, but the
-# engine recognizes its recorded base and returns before a full reconcile. That
-# matters for shell-hook renames because Herdr's foreground_cwd can lag $PWD
-# until focus changes.
+# Re-apply on a user rename (alt+r). Our own rename also re-fires this; the
+# idempotent skip-if-correct guard stops the loop.
 [[events]]
 on = "tab.renamed"
 command = ["bash", "automatic-rename.sh", "tab.renamed"]
@@ -156,6 +155,15 @@ id = "reset"
 title = "Reset tab to automatic naming"
 contexts = ["global"]
 command = ["bash", "automatic-rename.sh", "reset"]
+
+# Print why the current tab has the name it has: versions, the tab's state
+# record, its label, and the decisions one real pass made about it. Invoke with
+#   herdr plugin action invoke herdr-automatic-rename.doctor
+[[actions]]
+id = "doctor"
+title = "Herdr Automatic Rename: explain this tab's name"
+contexts = ["global"]
+command = ["bash", "automatic-rename.sh", "doctor"]
 
 # Strip every "[N] " prefix (restore base names / revert agents to detection).
 # For a clean uninstall, run the strip directly BEFORE uninstalling, so the

@@ -6,13 +6,13 @@
 # the literal word "l". No program list can match a function name, so the tab
 # flashed "l" and precmd snapped it back -- a flicker on every instant function.
 # The hooks now classify the command word; anything that is not an external
-# command gets a trailing "shell" marker, and the engine names the tab by the
+# command gets a "shell" third argument, and the engine names the tab by the
 # pane's REAL foreground process (sampled after a short settle) instead of by
-# the typed word. New hook calls place cwd before that marker; the legacy form
-# without cwd remains supported.
+# the typed word.
 
 set -o pipefail
 here=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=tests/lib.sh
 . "$here/lib.sh"
 
 ENGINE="$here/../automatic-rename.sh"
@@ -33,6 +33,12 @@ setup() {
   export SHELL_NAME=zsh
   export NAME_TABS=1 AUTO_INDEX=1
   unset HIDE_SHELL                            # per-scenario opt-in; default is off
+  unset AUTO_INDEX_WORKSPACES AUTO_INDEX_TABS AUTO_INDEX_AGENTS   # per-kind opt-in
+  # These scenarios are about which PROGRAM the hook names a tab after, and the
+  # hook names the context from the shell's own $PWD -- which here is wherever
+  # the suite was started, so every expected label would carry that directory.
+  # The hook's own context handling is pinned in tests/test_context.sh instead.
+  export TAB_CONTEXT=0
   export HERDR_TAB_ID=t1 HERDR_PANE_ID=p1
   mkdir -p "$XDG_STATE_HOME/herdr-automatic-rename"
   printf '{"t1":{"auto":"zsh","enabled":true}}\n' \
@@ -159,123 +165,53 @@ printf '{"t1":{"auto":"","enabled":true}}\n' \
 check "hidden tab: no repeat rename" "" "$(log)"
 teardown
 
+# The fast path reads the TAB scope, not AUTO_INDEX: with tabs opted out of
+# numbering while the master stays on, a per-command rename drops the prefix the
+# label was carrying instead of preserving it.
+setup
+export AUTO_INDEX_TABS=0
+/usr/bin/env bash "$ENGINE" preexec "nvim README.md"
+check "tabs opted out: prefix dropped" "tab rename t1 nvim" "$(log)"
+teardown
+
+# And the mirror: workspaces opted out leaves the tab fast path numbering as
+# before, so the scopes cannot bleed into one another here either.
+setup
+export AUTO_INDEX_WORKSPACES=0
+/usr/bin/env bash "$ENGINE" preexec "nvim README.md"
+check "workspaces opted out: tab keeps number" "tab rename t1 [1] nvim" "$(log)"
+teardown
+
+
 # ======================================================================
-# Scenario 7: new fast-path calls pass the shell's cwd directly.
+# The two naming paths on an agent tab. Both paths must agree: a hook that
+# named a tab differently from the reconcile would flip it on every prompt, the flicker the fast path exists to avoid. This is
+# the one known exception, and it is recorded here rather than hidden. The fast
+# path names by the command word the moment it starts, and no title exists yet,
+# so the tab reads "claude" (or its alias). The reconcile that follows reads the
+# title the agent set on its terminal and names the tab after the work. The
+# reconcile only ever moves the label forward, from program to task, so nothing
+# flips back. Either path changing its answer fails here, out loud.
 # ======================================================================
 setup
-/usr/bin/env bash "$ENGINE" preexec "nvim README.md" "/Users/test/code/foo"
-check "preexec: appends shell cwd" "tab rename t1 [1] nvim:foo" "$(log)"
-teardown
-
-# A prompt update uses the shell's current directory even with HIDE_SHELL on;
-# this is the path that updates the name after `cd`.
-setup
-export HIDE_SHELL=1
-fixture tab_t1.json <<'JSON'
-{"result":{"tab":{"tab_id":"t1","label":"[1] nvim"}}}
+export AGENT_TITLES=1
+/usr/bin/env bash "$ENGINE" preexec "claude"
+check "fast path: an agent tab is named after the program" "tab rename t1 [1] claude" "$(log)"
+: >"$HERDR_MOCK_LOG"
+# The same tab and pane as herdr reports them a moment later: the label the fast
+# path just wrote, the agent detected, and the title the agent has set since.
+fixture snapshot.json <<'JSON'
+{"result":{"snapshot":{
+  "workspaces":[{"workspace_id":"w1","label":"[1] api"}],
+  "tabs":[{"tab_id":"t1","label":"[1] claude","pane_count":1,"focused":true,"workspace_id":"w1"}],
+  "panes":[{"pane_id":"p1","tab_id":"t1","focused":true,"agent":"claude","agent_status":"working",
+            "terminal_title_stripped":"Fix the revenue query","foreground_cwd":"/home/u/dev/api"}],
+  "agents":[]
+}}}
 JSON
-printf '{"t1":{"auto":"nvim","enabled":true}}\n' \
-  >"$XDG_STATE_HOME/herdr-automatic-rename/state.json"
-/usr/bin/env bash "$ENGINE" precmd zsh "/Users/test/code/foo"
-check "precmd: current cwd replaces shell" "tab rename t1 [1] foo" "$(log)"
-teardown
-
-# The new sampled form carries cwd before the shell marker. The legacy marker
-# form remains covered by scenarios 1-3 above.
-setup
-fixture procinfo_p1.json <<'JSON'
-{"result":{"process_info":{"foreground_process_group_id":200,
-  "foreground_processes":[{"pid":200,"argv0":"nvim","cmdline":"nvim README.md"}]}}}
-JSON
-/usr/bin/env bash "$ENGINE" preexec "v" "/Users/test/code/foo" shell
-check "sampled preexec: appends shell cwd" "tab rename t1 [1] nvim:foo" "$(log)"
-teardown
-
-# A fast prompt rename emits tab.renamed. Herdr may still report the previous
-# foreground_cwd until focus changes, so that self-event must not reconcile the
-# authoritative hook label back to the stale directory.
-setup
-fixture tab_t1.json <<'JSON'
-{"result":{"tab":{"tab_id":"t1","label":"[1] zsh"}}}
-JSON
-/usr/bin/env bash "$ENGINE" precmd zsh "/Users/test/code/new"
-check "cwd race: fast path writes new directory" "tab rename t1 [1] new" "$(log)"
-
-fixture tab_t1.json <<'JSON'
-{"result":{"tab":{"tab_id":"t1","label":"[1] new"}}}
-JSON
-fixture workspaces.json <<'JSON'
-{"result":{"workspaces":[{"workspace_id":"w1","label":"code"}]}}
-JSON
-fixture tabs_w1.json <<'JSON'
-{"result":{"tabs":[{"tab_id":"t1","label":"[1] new","pane_count":1,"focused":true}]}}
-JSON
-fixture panes.json <<'JSON'
-{"result":{"panes":[{"pane_id":"p1","tab_id":"t1","focused":true,"foreground_cwd":"/Users/test/code/old"}]}}
-JSON
-fixture procinfo_p1.json <<'JSON'
-{"result":{"process_info":{"foreground_process_group_id":100,
-  "foreground_processes":[{"pid":100,"argv0":"-zsh","cmdline":"-zsh"}]}}}
-JSON
-/usr/bin/env bash "$ENGINE" tab.renamed
-check "cwd race: self-event keeps authoritative hook cwd" \
-  "tab rename t1 [1] new" "$(log)"
-teardown
-
-# A genuine manual rename still runs the full ownership state machine and opts
-# the tab out; only labels matching our recorded auto-name are suppressed.
-setup
-fixture tab_t1.json <<'JSON'
-{"result":{"tab":{"tab_id":"t1","label":"[1] notes"}}}
-JSON
-fixture workspaces.json <<'JSON'
-{"result":{"workspaces":[{"workspace_id":"w1","label":"[1] code"}]}}
-JSON
-fixture tabs_w1.json <<'JSON'
-{"result":{"tabs":[{"tab_id":"t1","label":"[1] notes","pane_count":1,"focused":true}]}}
-JSON
-/usr/bin/env bash "$ENGINE" tab.renamed
-check "manual rename event: tab opts out" "false" \
-  "$(jq -r '.t1.enabled' "$XDG_STATE_HOME/herdr-automatic-rename/state.json")"
-check "manual rename event: label is preserved" "" "$(log)"
-teardown
-
-# `cd` is sampled as a shell construct. Its delayed preexec worker carries the
-# old cwd and can finish after precmd has already written the new cwd. When the
-# sampled foreground process is only the shell, it must not overwrite that
-# newer prompt label.
-setup
-fixture tab_t1.json <<'JSON'
-{"result":{"tab":{"tab_id":"t1","label":"[1] new"}}}
-JSON
-printf '{"t1":{"auto":"new","enabled":true}}\n' \
-  >"$XDG_STATE_HOME/herdr-automatic-rename/state.json"
-fixture procinfo_p1.json <<'JSON'
-{"result":{"process_info":{"foreground_process_group_id":100,
-  "foreground_processes":[{"pid":100,"argv0":"-zsh","cmdline":"-zsh"}]}}}
-JSON
-/usr/bin/env bash "$ENGINE" preexec "cd new" "/Users/test/code/old" shell
-check "cd race: delayed sampled shell keeps newer prompt cwd" "" "$(log)"
-teardown
-
-# State publication must land before a fast rename is attempted.
-setup
-printf 'mktemp() { return 1; }\n' > "$HERDR_AUTOMATIC_RENAME_CONFIG"
-/usr/bin/env bash "$ENGINE" preexec "nvim README.md"
-check "failed fast state write prevents rename" "" "$(log)"
-check "failed fast state write keeps prior claim" "zsh" \
-  "$(jq -r '.t1.auto' "$XDG_STATE_HOME/herdr-automatic-rename/state.json")"
-teardown
-
-setup
-: > "$HERDR_MOCK_DIR/tab_rename.fail"
-/usr/bin/env bash "$ENGINE" preexec "nvim README.md"
-check "rejected fast rename restores prior claim" "zsh" \
-  "$(jq -r '.t1.auto' "$XDG_STATE_HOME/herdr-automatic-rename/state.json")"
-rm -f "$HERDR_MOCK_DIR/tab_rename.fail"
-: > "$HERDR_MOCK_LOG"
-/usr/bin/env bash "$ENGINE" preexec "nvim README.md"
-check "rejected fast rename can retry" "tab rename t1 [1] nvim" "$(log)"
+/usr/bin/env bash "$ENGINE" tab.focused
+check_contains "reconcile: the same tab is named after the title" "$(log)" \
+  "tab rename t1 [1] Fix the revenue query"
 teardown
 
 t_summary
