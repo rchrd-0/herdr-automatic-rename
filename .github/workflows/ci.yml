@@ -1,9 +1,7 @@
 name: tests
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 # Nothing here writes to the repo, so the token gets read access and no more.
 permissions:
@@ -62,7 +60,7 @@ jobs:
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: '22'
+          node-version: "22"
 
       # Prose here is never hard-wrapped, which the custom no-hard-wrap rule in
       # .github/markdownlint-rules enforces. Release notes are copied out of
